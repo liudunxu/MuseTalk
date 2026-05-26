@@ -185,7 +185,7 @@ class LipSyncRequest(BaseModel):
 class FaceListRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     similarity_threshold: float = Field(0.78, ge=0.0, le=1.0)
-    frame_sample_interval: int = Field(1, ge=1, le=300)
+    frame_sample_interval: int = Field(0, ge=0, le=300, description="0 means sample about 2 frames per second")
     max_frames: int = Field(0, ge=0, description="0 means scan all sampled frames")
     min_face_area: int = Field(400, ge=1)
     min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
@@ -794,9 +794,9 @@ class MuseTalkApiRuntime:
         }
         embedding = self._face_embedding(embedding_crop)
         if embedding is None:
-            embedding = self._face_embedding(frame, clipped)
-        if embedding is None:
             embedding = self._crop_face_embedding(embedding_crop)
+        if embedding is None:
+            embedding = self._face_embedding(frame, clipped)
         if embedding is not None:
             descriptor["embedding"] = embedding
         return descriptor
@@ -1026,11 +1026,9 @@ class MuseTalkApiRuntime:
         detection_score: float,
         similarity_threshold: float,
         crop_padding: float,
-        crop: Optional[np.ndarray] = None,
     ) -> None:
         area = _box_area(bbox)
-        if crop is None:
-            crop = self._crop_face(frame, bbox, crop_padding)
+        crop = self._crop_face(frame, bbox, crop_padding)
         if crop is None:
             return
 
@@ -1075,7 +1073,8 @@ class MuseTalkApiRuntime:
     ) -> Dict[str, object]:
         self.load_detectors()
         with self.run_lock:
-            frames, _ = _read_video_frames(video_path)
+            frames, fps = _read_video_frames(video_path)
+            sample_interval = payload.frame_sample_interval or max(1, int(round(fps / 2.0)))
             clusters: List[Dict[str, object]] = []
             scanned_frames = 0
             detections = 0
@@ -1085,7 +1084,16 @@ class MuseTalkApiRuntime:
             rejected_embedding = 0
             rejected_avatar_crop = 0
 
-            for frame_index in range(0, len(frames), payload.frame_sample_interval):
+            frame_indices = range(0, len(frames), sample_interval)
+            total_scan_frames = len(frame_indices)
+            if payload.max_frames:
+                total_scan_frames = min(total_scan_frames, payload.max_frames)
+            for frame_index in _progress(
+                frame_indices,
+                "scan faces",
+                total=total_scan_frames,
+                unit="frame",
+            ):
                 if payload.max_frames and scanned_frames >= payload.max_frames:
                     break
 
@@ -1118,15 +1126,6 @@ class MuseTalkApiRuntime:
                     if payload.require_face_embedding and "embedding" not in descriptor:
                         rejected_embedding += 1
                         continue
-                    avatar_crop = self._avatar_ready_face_crop(
-                        frame,
-                        bbox,
-                        payload.crop_padding,
-                        payload.require_face_embedding,
-                    )
-                    if avatar_crop is None:
-                        rejected_avatar_crop += 1
-                        continue
                     detections += 1
                     self._add_face_to_clusters(
                         clusters,
@@ -1137,7 +1136,6 @@ class MuseTalkApiRuntime:
                         detection_score,
                         payload.similarity_threshold,
                         payload.crop_padding,
-                        crop=avatar_crop,
                     )
 
             clusters.sort(key=lambda item: int(item["max_area"]), reverse=True)
@@ -1146,9 +1144,19 @@ class MuseTalkApiRuntime:
 
             face_paths = []
             face_items = []
-            for index, cluster in enumerate(clusters):
+            for cluster in clusters:
+                avatar_crop = self._avatar_ready_face_crop(
+                    frames[int(cluster["best_frame_index"])],
+                    cluster["best_bbox"],
+                    payload.crop_padding,
+                    payload.require_face_embedding,
+                )
+                if avatar_crop is None:
+                    rejected_avatar_crop += 1
+                    continue
+                index = len(face_paths)
                 face_path = faces_dir / f"face_{index:03d}.jpg"
-                cv2.imwrite(str(face_path), cluster["best_crop"])
+                cv2.imwrite(str(face_path), avatar_crop)
                 face_paths.append(face_path)
                 face_items.append(
                     {
@@ -1164,6 +1172,7 @@ class MuseTalkApiRuntime:
                 "face_paths": face_paths,
                 "faces": face_items,
                 "source_frame_count": len(frames),
+                "frame_sample_interval": sample_interval,
                 "scanned_frame_count": scanned_frames,
                 "detected_face_count": detections,
                 "rejected_low_score_count": rejected_low_score,
