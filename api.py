@@ -19,6 +19,7 @@ import numpy as np
 import requests
 import torch
 
+os.environ.setdefault("NO_ALBUMENTATIONS_UPDATE", "1")
 os.environ.setdefault("USE_FLAX", "0")
 os.environ.setdefault("USE_TF", "0")
 
@@ -444,15 +445,15 @@ class MuseTalkApiRuntime:
             self.face_embedding_loaded = True
             return
 
-        model_dir = Path(settings.face_embedding_root) / "models" / settings.face_embedding_model
-        if backend == "auto" and not model_dir.exists():
-            self.face_embedding_error = f"InsightFace model directory not found: {model_dir}"
-            self.face_embedding_loaded = True
-            return
-
         try:
             from insightface.app import FaceAnalysis
 
+            model_dir = Path(settings.face_embedding_root) / "models" / settings.face_embedding_model
+            if not model_dir.exists():
+                logger.warning(
+                    "InsightFace model directory %s was not found. FaceAnalysis may try to download it.",
+                    model_dir,
+                )
             providers = (
                 ["CUDAExecutionProvider", "CPUExecutionProvider"]
                 if torch.cuda.is_available()

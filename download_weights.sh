@@ -4,11 +4,12 @@
 CheckpointsDir="models"
 
 # Create necessary directories
-mkdir -p models/musetalk models/musetalkV15 models/syncnet models/dwpose models/face-parse-bisent models/sd-vae models/whisper
+mkdir -p models/musetalk models/musetalkV15 models/syncnet models/dwpose models/face-parse-bisent models/sd-vae models/whisper models/insightface
 
 # Install required packages
 pip install -U "huggingface_hub[cli]"
 pip install gdown
+pip install insightface onnxruntime-gpu
 
 # Set HuggingFace mirror endpoint
 export HF_ENDPOINT=https://hf-mirror.com
@@ -47,5 +48,13 @@ huggingface-cli download ByteDance/LatentSync \
 gdown --id 154JgKpzCPW82qINcVieuPH3fZ2e0P812 -O $CheckpointsDir/face-parse-bisent/79999_iter.pth
 curl -L https://download.pytorch.org/models/resnet18-5c106cde.pth \
   -o $CheckpointsDir/face-parse-bisent/resnet18-5c106cde.pth
+
+# Download InsightFace ArcFace weights used by /api/lipsync identity matching.
+python - <<'PY'
+from insightface.app import FaceAnalysis
+
+app = FaceAnalysis(name="buffalo_l", root="models/insightface", providers=["CPUExecutionProvider"])
+app.prepare(ctx_id=-1, det_size=(640, 640))
+PY
 
 echo "✅ All weights have been downloaded successfully!" 
