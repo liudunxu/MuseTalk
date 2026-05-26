@@ -18,6 +18,10 @@ import cv2
 import numpy as np
 import requests
 import torch
+
+os.environ.setdefault("USE_FLAX", "0")
+os.environ.setdefault("USE_TF", "0")
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import http_exception_handler
