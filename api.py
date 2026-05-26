@@ -184,15 +184,16 @@ class LipSyncRequest(BaseModel):
 
 class FaceListRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
-    similarity_threshold: float = Field(0.62, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.78, ge=0.0, le=1.0)
     frame_sample_interval: int = Field(1, ge=1, le=300)
     max_frames: int = Field(0, ge=0, description="0 means scan all sampled frames")
     min_face_area: int = Field(400, ge=1)
-    min_detection_score: float = Field(0.85, ge=0.0, le=1.0)
+    min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
+    require_face_embedding: bool = True
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
-    crop_padding: float = Field(0.25, ge=0.0, le=1.0)
+    crop_padding: float = Field(0.8, ge=0.0, le=1.5)
 
 
 app = FastAPI(title="MuseTalk lip-sync API")
@@ -416,6 +417,9 @@ class MuseTalkApiRuntime:
         self.run_lock = threading.Lock()
         self.face_parser_cache: Dict[Tuple[int, int], FaceParsing] = {}
         self.face_embedder = None
+        self.face_recognition_session = None
+        self.face_recognition_input_name = ""
+        self.face_recognition_output_name = ""
         self.face_embedding_loaded = False
         self.face_embedding_error = ""
 
@@ -467,6 +471,7 @@ class MuseTalkApiRuntime:
             ctx_id = settings.gpu_id if torch.cuda.is_available() else -1
             det_size = (settings.face_embedding_det_size, settings.face_embedding_det_size)
             self.face_embedder.prepare(ctx_id=ctx_id, det_size=det_size)
+            self._load_crop_face_embedder(providers)
         except Exception as exc:
             self.face_embedding_error = str(exc)
             self.face_embedder = None
@@ -474,6 +479,32 @@ class MuseTalkApiRuntime:
                 raise RuntimeError(f"Failed to load InsightFace embedding backend: {exc}") from exc
         finally:
             self.face_embedding_loaded = True
+
+    def _load_crop_face_embedder(self, providers: List[str]) -> None:
+        model_path = (
+            Path(settings.face_embedding_root)
+            / "models"
+            / settings.face_embedding_model
+            / "w600k_r50.onnx"
+        )
+        if not model_path.is_file():
+            return
+        try:
+            import onnxruntime as ort
+
+            available_providers = set(ort.get_available_providers())
+            session_providers = [provider for provider in providers if provider in available_providers]
+            if not session_providers:
+                session_providers = ["CPUExecutionProvider"]
+            self.face_recognition_session = ort.InferenceSession(
+                str(model_path),
+                providers=session_providers,
+            )
+            self.face_recognition_input_name = self.face_recognition_session.get_inputs()[0].name
+            self.face_recognition_output_name = self.face_recognition_session.get_outputs()[0].name
+        except Exception as exc:
+            self.face_embedding_error = str(exc)
+            self.face_recognition_session = None
 
     def load(self) -> None:
         if self.loaded:
@@ -652,6 +683,27 @@ class MuseTalkApiRuntime:
             return None
         return _normalize_vector(np.asarray(embedding, dtype=np.float32))
 
+    def _crop_face_embedding(self, crop: np.ndarray) -> Optional[np.ndarray]:
+        if self.face_recognition_session is None or crop.size == 0:
+            return None
+        try:
+            resized = cv2.resize(crop, (112, 112), interpolation=cv2.INTER_AREA)
+            blob = cv2.dnn.blobFromImage(
+                resized,
+                scalefactor=1.0 / 127.5,
+                size=(112, 112),
+                mean=(127.5, 127.5, 127.5),
+                swapRB=True,
+            )
+            embedding = self.face_recognition_session.run(
+                [self.face_recognition_output_name],
+                {self.face_recognition_input_name: blob},
+            )[0]
+        except Exception as exc:
+            self.face_embedding_error = str(exc)
+            return None
+        return _normalize_vector(np.asarray(embedding, dtype=np.float32).reshape(-1))
+
     def _spatial_histogram(self, hsv: np.ndarray, grid_size: int = 3) -> np.ndarray:
         height, width = hsv.shape[:2]
         features = []
@@ -743,6 +795,8 @@ class MuseTalkApiRuntime:
         embedding = self._face_embedding(embedding_crop)
         if embedding is None:
             embedding = self._face_embedding(frame, clipped)
+        if embedding is None:
+            embedding = self._crop_face_embedding(embedding_crop)
         if embedding is not None:
             descriptor["embedding"] = embedding
         return descriptor
@@ -861,24 +915,54 @@ class MuseTalkApiRuntime:
         if avatar is None:
             raise RuntimeError(f"Could not read avatar image: {avatar_path}")
 
-        boxes = self._detect_face_boxes(avatar)
-        if not boxes:
-            if self.face_embedder is not None:
-                height, width = avatar.shape[:2]
-                descriptor = self._face_descriptor(avatar, (0, 0, width, height))
-                if descriptor is not None and "embedding" in descriptor:
-                    return descriptor
-            raise RuntimeError("No face was detected in the avatar image.")
-
-        descriptor = self._face_descriptor(avatar, boxes[0][0])
+        descriptor = self._avatar_descriptor_from_image(avatar)
         if descriptor is None:
-            raise RuntimeError("Could not build avatar face descriptor.")
-        if "embedding" not in descriptor and self.face_embedder is not None:
-            height, width = avatar.shape[:2]
-            full_descriptor = self._face_descriptor(avatar, (0, 0, width, height))
-            if full_descriptor is not None and "embedding" in full_descriptor:
-                return full_descriptor
+            raise RuntimeError("No face was detected in the avatar image.")
         return descriptor
+
+    def _avatar_descriptor_from_image(self, avatar: np.ndarray) -> Optional[Dict[str, np.ndarray]]:
+        boxes = self._detect_face_boxes(avatar)
+        fallback_descriptor = None
+        for bbox, _ in boxes:
+            descriptor = self._face_descriptor(avatar, bbox)
+            if descriptor is None:
+                continue
+            if "embedding" in descriptor:
+                return descriptor
+            if fallback_descriptor is None:
+                fallback_descriptor = descriptor
+
+        height, width = avatar.shape[:2]
+        descriptor = self._face_descriptor(avatar, (0, 0, width, height))
+        if descriptor is None:
+            return fallback_descriptor
+        if "embedding" in descriptor:
+            return descriptor
+        return fallback_descriptor or descriptor
+
+    def _avatar_ready_face_crop(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        crop_padding: float,
+        require_embedding: bool,
+    ) -> Optional[np.ndarray]:
+        paddings = []
+        for padding in (crop_padding, 0.8, 1.0, 1.25):
+            if padding not in paddings:
+                paddings.append(padding)
+
+        for padding in paddings:
+            crop = self._crop_face(frame, bbox, padding)
+            if crop is None:
+                continue
+            descriptor = self._avatar_descriptor_from_image(crop)
+            if descriptor is None:
+                continue
+            if require_embedding and "embedding" not in descriptor:
+                continue
+            return crop
+        return None
 
     def _passes_face_filters(
         self,
@@ -942,9 +1026,11 @@ class MuseTalkApiRuntime:
         detection_score: float,
         similarity_threshold: float,
         crop_padding: float,
+        crop: Optional[np.ndarray] = None,
     ) -> None:
         area = _box_area(bbox)
-        crop = self._crop_face(frame, bbox, crop_padding)
+        if crop is None:
+            crop = self._crop_face(frame, bbox, crop_padding)
         if crop is None:
             return
 
@@ -996,6 +1082,8 @@ class MuseTalkApiRuntime:
             rejected_low_score = 0
             rejected_shape = 0
             rejected_landmarks = 0
+            rejected_embedding = 0
+            rejected_avatar_crop = 0
 
             for frame_index in range(0, len(frames), payload.frame_sample_interval):
                 if payload.max_frames and scanned_frames >= payload.max_frames:
@@ -1027,6 +1115,18 @@ class MuseTalkApiRuntime:
                     if descriptor is None:
                         rejected_shape += 1
                         continue
+                    if payload.require_face_embedding and "embedding" not in descriptor:
+                        rejected_embedding += 1
+                        continue
+                    avatar_crop = self._avatar_ready_face_crop(
+                        frame,
+                        bbox,
+                        payload.crop_padding,
+                        payload.require_face_embedding,
+                    )
+                    if avatar_crop is None:
+                        rejected_avatar_crop += 1
+                        continue
                     detections += 1
                     self._add_face_to_clusters(
                         clusters,
@@ -1037,6 +1137,7 @@ class MuseTalkApiRuntime:
                         detection_score,
                         payload.similarity_threshold,
                         payload.crop_padding,
+                        crop=avatar_crop,
                     )
 
             clusters.sort(key=lambda item: int(item["max_area"]), reverse=True)
@@ -1068,6 +1169,9 @@ class MuseTalkApiRuntime:
                 "rejected_low_score_count": rejected_low_score,
                 "rejected_shape_count": rejected_shape,
                 "rejected_landmark_count": rejected_landmarks,
+                "rejected_embedding_count": rejected_embedding,
+                "rejected_avatar_crop_count": rejected_avatar_crop,
+                "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
             }
 
     def _select_target_bbox(
@@ -1543,6 +1647,7 @@ def health() -> Dict[str, object]:
         "detectors_loaded": runtime.detectors_loaded,
         "model_loaded": runtime.loaded,
         "face_embedding_loaded": runtime.face_embedder is not None,
+        "crop_face_embedding_loaded": runtime.face_recognition_session is not None,
         "face_embedding_backend": settings.face_embedding_backend,
         "face_embedding_error": runtime.face_embedding_error,
         "port": settings.port,
