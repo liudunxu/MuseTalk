@@ -55,7 +55,10 @@ def get_bbox_range(img_list,upperbondrange =0):
     for fb in tqdm(batches):
         results = inference_topdown(model, np.asarray(fb)[0])
         results = merge_data_samples(results)
-        keypoints = results.pred_instances.keypoints
+        keypoints = getattr(results.pred_instances, "keypoints", None)
+        if keypoints is None or len(keypoints) == 0:
+            coords_list += [coord_placeholder]
+            continue
         face_land_mark= keypoints[0][23:91]
         face_land_mark = face_land_mark.astype(np.int32)
         
@@ -77,7 +80,9 @@ def get_bbox_range(img_list,upperbondrange =0):
             if upperbondrange != 0:
                 half_face_coord[1] = upperbondrange+half_face_coord[1] #手动调整  + 向下（偏29）  - 向上（偏28）
 
-    text_range=f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}"
+    range_minus = int(sum(average_range_minus) / len(average_range_minus)) if average_range_minus else 0
+    range_plus = int(sum(average_range_plus) / len(average_range_plus)) if average_range_plus else 0
+    text_range=f"Total frame:「{len(frames)}」 Manually adjust range : [ -{range_minus}~{range_plus} ] , the current value: {upperbondrange}"
     return text_range
     
 
@@ -96,7 +101,10 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
     for fb in tqdm(batches):
         results = inference_topdown(model, np.asarray(fb)[0])
         results = merge_data_samples(results)
-        keypoints = results.pred_instances.keypoints
+        keypoints = getattr(results.pred_instances, "keypoints", None)
+        if keypoints is None or len(keypoints) == 0:
+            coords_list += [coord_placeholder]
+            continue
         face_land_mark= keypoints[0][23:91]
         face_land_mark = face_land_mark.astype(np.int32)
         
@@ -132,7 +140,9 @@ def get_landmark_and_bbox(img_list,upperbondrange =0):
                 coords_list += [f_landmark]
     
     print("********************************************bbox_shift parameter adjustment**********************************************************")
-    print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{int(sum(average_range_minus) / len(average_range_minus))}~{int(sum(average_range_plus) / len(average_range_plus))} ] , the current value: {upperbondrange}")
+    range_minus = int(sum(average_range_minus) / len(average_range_minus)) if average_range_minus else 0
+    range_plus = int(sum(average_range_plus) / len(average_range_plus)) if average_range_plus else 0
+    print(f"Total frame:「{len(frames)}」 Manually adjust range : [ -{range_minus}~{range_plus} ] , the current value: {upperbondrange}")
     print("*************************************************************************************************************************************")
     return coords_list,frames
     
