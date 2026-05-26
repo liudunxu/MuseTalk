@@ -22,6 +22,11 @@ import torch
 os.environ.setdefault("USE_FLAX", "0")
 os.environ.setdefault("USE_TF", "0")
 
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
+
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import http_exception_handler
@@ -72,6 +77,7 @@ class Settings:
         str(PROJECT_DIR / "models" / "insightface"),
     )
     face_embedding_det_size: int = int(os.getenv("MUSETALK_FACE_EMBEDDING_DET_SIZE", "640"))
+    progress_enabled: bool = os.getenv("API_PROGRESS", "1").lower() not in {"0", "false", "no", "off"}
 
 
 settings = Settings()
@@ -158,8 +164,9 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: str = Field(..., description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.72, ge=0.0, le=1.0)
-    identity_margin: float = Field(0.07, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.78, ge=0.0, le=1.0)
+    identity_margin: float = Field(0.12, ge=0.0, le=1.0)
+    require_face_embedding: bool = True
     min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
@@ -385,6 +392,19 @@ def _normalize_vector(vector: np.ndarray) -> np.ndarray:
     if norm < 1e-8:
         return vector.astype(np.float32)
     return (vector / norm).astype(np.float32)
+
+
+def _progress(iterable, desc: str, total: Optional[int] = None, unit: str = "it"):
+    if not settings.progress_enabled or tqdm is None:
+        return iterable
+    return tqdm(
+        iterable,
+        desc=desc,
+        total=total,
+        unit=unit,
+        dynamic_ncols=True,
+        leave=True,
+    )
 
 
 class MuseTalkApiRuntime:
@@ -684,6 +704,9 @@ class MuseTalkApiRuntime:
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             return None
+        embedding_crop = self._crop_face(frame, bbox, 0.25)
+        if embedding_crop is None:
+            embedding_crop = crop
 
         crop = cv2.resize(crop, (112, 112), interpolation=cv2.INTER_AREA)
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -706,7 +729,7 @@ class MuseTalkApiRuntime:
             "lbp": lbp,
             "grad": grad,
         }
-        embedding = self._face_embedding(crop)
+        embedding = self._face_embedding(embedding_crop)
         if embedding is not None:
             descriptor["embedding"] = embedding
         return descriptor
@@ -1042,6 +1065,7 @@ class MuseTalkApiRuntime:
         min_landmark_overlap: float = 0.08,
         expected_descriptors: Optional[List[Dict[str, np.ndarray]]] = None,
         negative_descriptors: Optional[List[Dict[str, np.ndarray]]] = None,
+        require_embedding: bool = False,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         face_boxes = self._detect_face_boxes(frame)
         if not face_boxes:
@@ -1068,7 +1092,11 @@ class MuseTalkApiRuntime:
             descriptor = self._face_descriptor(frame, bbox)
             if descriptor is None:
                 continue
+            if require_embedding and "embedding" not in descriptor:
+                continue
             avatar_score = self._descriptor_similarity(avatar_descriptor, descriptor)
+            if require_embedding and avatar_score < threshold:
+                continue
             identity_score = (
                 max(self._descriptor_similarity(expected, descriptor) for expected in expected_descriptors)
                 if expected_descriptors
@@ -1107,7 +1135,12 @@ class MuseTalkApiRuntime:
     ) -> Optional[Dict[str, object]]:
         clusters: List[Dict[str, object]] = []
 
-        for frame_index, frame in enumerate(frames):
+        for frame_index, frame in _progress(
+            enumerate(frames),
+            "scan identity",
+            total=len(frames),
+            unit="frame",
+        ):
             landmarks = self._pose_face_landmarks(frame) if payload.require_landmark_match else []
             for bbox, detection_score in self._detect_face_boxes(frame):
                 if not self._passes_face_filters(
@@ -1123,6 +1156,8 @@ class MuseTalkApiRuntime:
                     continue
                 descriptor = self._face_descriptor(frame, bbox)
                 if descriptor is None:
+                    continue
+                if payload.require_face_embedding and "embedding" not in descriptor:
                     continue
                 self._add_face_to_clusters(
                     clusters,
@@ -1193,7 +1228,12 @@ class MuseTalkApiRuntime:
         extra_margin: int,
     ) -> Dict[int, torch.Tensor]:
         latents_by_frame: Dict[int, torch.Tensor] = {}
-        for index, target in enumerate(targets):
+        for index, target in _progress(
+            enumerate(targets),
+            "encode latents",
+            total=len(targets),
+            unit="frame",
+        ):
             bbox = target.get("bbox")
             if bbox is None:
                 continue
@@ -1219,7 +1259,9 @@ class MuseTalkApiRuntime:
         batch_size: int,
     ) -> Dict[int, np.ndarray]:
         generated: Dict[int, np.ndarray] = {}
-        for start in range(0, len(process_items), batch_size):
+        batch_starts = range(0, len(process_items), batch_size)
+        total_batches = math.ceil(len(process_items) / batch_size) if process_items else 0
+        for start in _progress(batch_starts, "run inference", total=total_batches, unit="batch"):
             batch = process_items[start:start + batch_size]
             output_indices = [item[0] for item in batch]
             whisper_batch = torch.stack([item[1] for item in batch]).to(self.device)
@@ -1250,7 +1292,12 @@ class MuseTalkApiRuntime:
     ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         frame_count = len(frames)
-        for output_index in range(output_frame_count):
+        for output_index in _progress(
+            range(output_frame_count),
+            "render frames",
+            total=output_frame_count,
+            unit="frame",
+        ):
             source_index = self._source_index_for_output(output_index, frame_count)
             original_frame = copy.deepcopy(frames[source_index])
             target = targets[source_index]
@@ -1338,6 +1385,11 @@ class MuseTalkApiRuntime:
         with self.run_lock:
             frames, fps = _read_video_frames(paths["video"])
             avatar_descriptor = self._avatar_descriptor(paths["avatar"])
+            if payload.require_face_embedding and "embedding" not in avatar_descriptor:
+                detail = "Face embedding is required for /api/lipsync, but the avatar image did not produce one."
+                if self.face_embedding_error:
+                    detail = f"{detail} InsightFace error: {self.face_embedding_error}"
+                raise RuntimeError(detail)
             target_identity = self._find_target_identity(frames, avatar_descriptor, payload)
             target_descriptors = target_identity.get("target_descriptors") if target_identity else []
             negative_descriptors = target_identity.get("negative_descriptors") if target_identity else []
@@ -1347,7 +1399,7 @@ class MuseTalkApiRuntime:
             targets = []
             matched_source_frames = 0
             best_scores = []
-            for frame in frames:
+            for frame in _progress(frames, "match target", total=len(frames), unit="frame"):
                 if target_descriptors:
                     bbox, score = self._select_target_bbox(
                         frame,
@@ -1361,6 +1413,7 @@ class MuseTalkApiRuntime:
                         min_landmark_overlap=payload.min_landmark_overlap,
                         expected_descriptors=target_descriptors,
                         negative_descriptors=negative_descriptors,
+                        require_embedding=payload.require_face_embedding,
                     )
                 else:
                     bbox, score = None, 0.0
