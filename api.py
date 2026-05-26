@@ -151,7 +151,11 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: str = Field(..., description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.48, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.62, ge=0.0, le=1.0)
+    min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
+    require_landmark_match: bool = True
+    min_landmark_points: int = Field(8, ge=1, le=68)
+    min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=80)
     parsing_mode: str = "jaw"
@@ -666,6 +670,34 @@ class MuseTalkApiRuntime:
             raise RuntimeError("Could not build avatar face descriptor.")
         return descriptor
 
+    def _passes_face_filters(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        detection_score: float,
+        min_detection_score: float,
+        landmarks: List[np.ndarray],
+        require_landmark_match: bool,
+        min_landmark_points: int,
+        min_landmark_overlap: float,
+        min_face_area: int = 0,
+    ) -> bool:
+        if detection_score < min_detection_score:
+            return False
+        if _box_area(bbox) < min_face_area:
+            return False
+        if not self._is_reasonable_face_box(bbox, frame.shape):
+            return False
+        if require_landmark_match and not self._face_box_matches_landmarks(
+            landmarks,
+            bbox,
+            frame.shape,
+            min_landmark_points,
+            min_landmark_overlap,
+        ):
+            return False
+        return True
+
     def _crop_face(
         self,
         frame: np.ndarray,
@@ -766,20 +798,20 @@ class MuseTalkApiRuntime:
                     if detection_score < payload.min_detection_score:
                         rejected_low_score += 1
                         continue
-                    if _box_area(bbox) < payload.min_face_area:
-                        rejected_shape += 1
-                        continue
-                    if not self._is_reasonable_face_box(bbox, frame.shape):
-                        rejected_shape += 1
-                        continue
-                    if payload.require_landmark_match and not self._face_box_matches_landmarks(
-                        landmarks,
+                    if not self._passes_face_filters(
+                        frame,
                         bbox,
-                        frame.shape,
+                        detection_score,
+                        payload.min_detection_score,
+                        landmarks,
+                        payload.require_landmark_match,
                         payload.min_landmark_points,
                         payload.min_landmark_overlap,
+                        payload.min_face_area,
                     ):
-                        rejected_landmarks += 1
+                        rejected_shape += 1
+                        if payload.require_landmark_match:
+                            rejected_landmarks += 1
                         continue
                     descriptor = self._face_descriptor(frame, bbox)
                     if descriptor is None:
@@ -834,28 +866,111 @@ class MuseTalkApiRuntime:
         avatar_descriptor: Dict[str, np.ndarray],
         threshold: float,
         bbox_shift: int,
+        min_detection_score: float = 0.0,
+        require_landmark_match: bool = False,
+        min_landmark_points: int = 8,
+        min_landmark_overlap: float = 0.08,
+        expected_descriptors: Optional[List[Dict[str, np.ndarray]]] = None,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         face_boxes = self._detect_face_boxes(frame)
         if not face_boxes:
             return None, 0.0
 
+        landmarks = self._pose_face_landmarks(frame) if require_landmark_match else []
         best_bbox = None
         best_score = -1.0
-        for bbox, _ in face_boxes:
+        best_identity_score = -1.0
+        for bbox, detection_score in face_boxes:
+            if not self._passes_face_filters(
+                frame,
+                bbox,
+                detection_score,
+                min_detection_score,
+                landmarks,
+                require_landmark_match,
+                min_landmark_points,
+                min_landmark_overlap,
+            ):
+                continue
             descriptor = self._face_descriptor(frame, bbox)
             if descriptor is None:
                 continue
-            score = self._descriptor_similarity(avatar_descriptor, descriptor)
+            avatar_score = self._descriptor_similarity(avatar_descriptor, descriptor)
+            identity_score = (
+                max(self._descriptor_similarity(expected, descriptor) for expected in expected_descriptors)
+                if expected_descriptors
+                else avatar_score
+            )
+            score = 0.4 * avatar_score + 0.6 * identity_score
             if score > best_score:
                 best_score = score
+                best_identity_score = identity_score
                 best_bbox = bbox
 
-        if best_bbox is None or best_score < threshold:
+        if best_bbox is None or best_identity_score < threshold:
             return None, max(0.0, best_score)
 
-        landmarks = self._pose_face_landmarks(frame)
         target_bbox = self._landmark_bbox_for_face(landmarks, best_bbox, bbox_shift, frame.shape)
         return target_bbox, best_score
+
+    def _find_target_identity(
+        self,
+        frames: List[np.ndarray],
+        avatar_descriptor: Dict[str, np.ndarray],
+        payload: LipSyncRequest,
+    ) -> Optional[Dict[str, object]]:
+        clusters: List[Dict[str, object]] = []
+
+        for frame_index, frame in enumerate(frames):
+            landmarks = self._pose_face_landmarks(frame) if payload.require_landmark_match else []
+            for bbox, detection_score in self._detect_face_boxes(frame):
+                if not self._passes_face_filters(
+                    frame,
+                    bbox,
+                    detection_score,
+                    payload.min_detection_score,
+                    landmarks,
+                    payload.require_landmark_match,
+                    payload.min_landmark_points,
+                    payload.min_landmark_overlap,
+                ):
+                    continue
+                descriptor = self._face_descriptor(frame, bbox)
+                if descriptor is None:
+                    continue
+                self._add_face_to_clusters(
+                    clusters,
+                    frame,
+                    bbox,
+                    descriptor,
+                    frame_index,
+                    detection_score,
+                    payload.similarity_threshold,
+                    0.0,
+                )
+
+        if not clusters:
+            return None
+
+        for cluster in clusters:
+            descriptors = cluster.get("descriptors") or []
+            cluster["avatar_score"] = max(
+                self._descriptor_similarity(avatar_descriptor, descriptor)
+                for descriptor in descriptors
+            )
+
+        clusters.sort(
+            key=lambda item: (
+                float(item["avatar_score"]),
+                int(item["count"]),
+                int(item["max_area"]),
+            ),
+            reverse=True,
+        )
+        best_cluster = clusters[0]
+        if float(best_cluster["avatar_score"]) < payload.similarity_threshold:
+            return None
+        return best_cluster
 
     def _bbox_with_margin(
         self,
@@ -1020,17 +1135,28 @@ class MuseTalkApiRuntime:
         with self.run_lock:
             frames, fps = _read_video_frames(paths["video"])
             avatar_descriptor = self._avatar_descriptor(paths["avatar"])
+            target_identity = self._find_target_identity(frames, avatar_descriptor, payload)
+            target_descriptors = target_identity.get("descriptors") if target_identity else []
+            target_identity_score = float(target_identity["avatar_score"]) if target_identity else 0.0
 
             targets = []
             matched_source_frames = 0
             best_scores = []
             for frame in frames:
-                bbox, score = self._select_target_bbox(
-                    frame,
-                    avatar_descriptor,
-                    payload.similarity_threshold,
-                    payload.bbox_shift,
-                )
+                if target_descriptors:
+                    bbox, score = self._select_target_bbox(
+                        frame,
+                        avatar_descriptor,
+                        payload.similarity_threshold,
+                        payload.bbox_shift,
+                        min_detection_score=payload.min_detection_score,
+                        require_landmark_match=payload.require_landmark_match,
+                        min_landmark_points=payload.min_landmark_points,
+                        min_landmark_overlap=payload.min_landmark_overlap,
+                        expected_descriptors=target_descriptors,
+                    )
+                else:
+                    bbox, score = None, 0.0
                 targets.append({"bbox": bbox, "score": score})
                 best_scores.append(score)
                 if bbox is not None:
@@ -1098,6 +1224,7 @@ class MuseTalkApiRuntime:
                 "generated_output_frames": len(generated),
                 "skipped_output_frames": skipped_output_frames,
                 "best_similarity": max(best_scores) if best_scores else 0.0,
+                "target_identity_similarity": target_identity_score,
             }
 
 
