@@ -174,6 +174,8 @@ class LipSyncRequest(BaseModel):
     target_fill_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
     target_fill_min_match_ratio: float = Field(0.45, ge=0.0, le=1.0)
     target_fill_max_center_shift: float = Field(1.5, ge=0.0, le=5.0)
+    target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
+    target_bbox_smoothing_max_center_shift: float = Field(0.75, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
@@ -185,6 +187,7 @@ class LipSyncRequest(BaseModel):
     extra_margin: int = Field(18, ge=0, le=100)
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
+    color_match_strength: float = Field(0.35, ge=0.0, le=1.0)
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -1552,6 +1555,58 @@ class MuseTalkApiRuntime:
                 filled += 1
         return filled
 
+    def _smooth_target_bboxes(
+        self,
+        targets: List[Dict[str, object]],
+        frame_shape: Tuple[int, int, int],
+        window_size: int,
+        max_center_shift: float,
+    ) -> int:
+        if window_size <= 1 or not targets:
+            return 0
+
+        radius = window_size // 2
+        original_bboxes = [target.get("bbox") for target in targets]
+        smoothed_bboxes: Dict[int, Tuple[int, int, int, int]] = {}
+        for index, bbox in enumerate(original_bboxes):
+            if bbox is None:
+                continue
+
+            weighted_boxes = []
+            start = max(0, index - radius)
+            end = min(len(original_bboxes), index + radius + 1)
+            for neighbor_index in range(start, end):
+                neighbor_bbox = original_bboxes[neighbor_index]
+                if neighbor_bbox is None:
+                    continue
+                if (
+                    neighbor_index != index
+                    and max_center_shift > 0.0
+                    and self._bbox_center_shift(bbox, neighbor_bbox) > max_center_shift
+                ):
+                    continue
+                weight = 2.0 if neighbor_index == index else 1.0
+                weighted_boxes.append((neighbor_bbox, weight))
+
+            if len(weighted_boxes) < 2:
+                continue
+            total_weight = sum(weight for _, weight in weighted_boxes)
+            averaged = tuple(
+                int(round(sum(box[coord] * weight for box, weight in weighted_boxes) / total_weight))
+                for coord in range(4)
+            )
+            clipped = _clip_box(averaged, frame_shape)
+            if clipped is not None and clipped != bbox:
+                smoothed_bboxes[index] = clipped
+
+        for index, bbox in smoothed_bboxes.items():
+            targets[index] = {
+                **targets[index],
+                "bbox": bbox,
+                "smoothed": True,
+            }
+        return len(smoothed_bboxes)
+
     def _encode_latents(
         self,
         frames: List[np.ndarray],
@@ -1615,6 +1670,29 @@ class MuseTalkApiRuntime:
                 generated[output_index] = result_frame
         return generated
 
+    def _match_color_stats(
+        self,
+        image: np.ndarray,
+        reference: np.ndarray,
+        strength: float,
+    ) -> np.ndarray:
+        if strength <= 0.0 or image.size == 0 or reference.size == 0:
+            return image
+        if image.shape != reference.shape:
+            return image
+
+        image_float = image.astype(np.float32)
+        reference_float = reference.astype(np.float32)
+        image_mean, image_std = cv2.meanStdDev(image_float)
+        reference_mean, reference_std = cv2.meanStdDev(reference_float)
+        image_mean = image_mean.reshape(1, 1, 3)
+        image_std = image_std.reshape(1, 1, 3)
+        reference_mean = reference_mean.reshape(1, 1, 3)
+        reference_std = reference_std.reshape(1, 1, 3)
+        matched = (image_float - image_mean) * (reference_std / np.maximum(image_std, 1.0)) + reference_mean
+        blended = image_float * (1.0 - strength) + matched * strength
+        return np.clip(blended, 0, 255).astype(np.uint8)
+
     def _write_result_frames(
         self,
         frames: List[np.ndarray],
@@ -1625,6 +1703,7 @@ class MuseTalkApiRuntime:
         extra_margin: int,
         parsing_mode: str,
         blend_upper_boundary_ratio: float,
+        color_match_strength: float,
         face_parser: Optional[FaceParsing],
     ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1674,6 +1753,8 @@ class MuseTalkApiRuntime:
                     (x2 - x1, y2 - y1),
                     interpolation=cv2.INTER_LANCZOS4,
                 )
+                reference_crop = original_frame[y1:y2, x1:x2]
+                resized = self._match_color_stats(resized, reference_crop, color_match_strength)
                 mask_array, crop_box = material
                 combined = get_image_blending(
                     original_frame,
@@ -1805,6 +1886,12 @@ class MuseTalkApiRuntime:
                 payload.target_fill_min_match_ratio,
                 payload.target_fill_max_center_shift,
             )
+            smoothed_source_frames = self._smooth_target_bboxes(
+                targets,
+                frames[0].shape if frames else (0, 0, 3),
+                payload.target_bbox_smoothing_window,
+                payload.target_bbox_smoothing_max_center_shift,
+            )
 
             whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(str(paths["audio"]))
             if whisper_input_features is None:
@@ -1849,6 +1936,7 @@ class MuseTalkApiRuntime:
                 payload.extra_margin,
                 payload.parsing_mode,
                 payload.blend_upper_boundary_ratio,
+                payload.color_match_strength,
                 face_parser,
             )
 
@@ -1867,6 +1955,7 @@ class MuseTalkApiRuntime:
                 "output_frame_count": output_frame_count,
                 "matched_source_frames": matched_source_frames,
                 "filled_source_frames": filled_source_frames,
+                "smoothed_source_frames": smoothed_source_frames,
                 "matched_or_filled_source_frames": matched_source_frames + filled_source_frames,
                 "generated_output_frames": len(generated),
                 "skipped_output_frames": skipped_output_frames,
