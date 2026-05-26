@@ -54,7 +54,7 @@ class Settings:
     ffmpeg_path: str = os.getenv("FFMPEG_PATH", "./ffmpeg-4.4-amd64-static/")
     gpu_id: int = int(os.getenv("MUSETALK_GPU_ID", "0"))
     version: str = os.getenv("MUSETALK_VERSION", "v15")
-    vae_type: str = os.getenv("MUSETALK_VAE_TYPE", "sd-vae")
+    vae_type: str = os.getenv("MUSETALK_VAE_TYPE", "")
     unet_config: str = os.getenv("MUSETALK_UNET_CONFIG", "./models/musetalkV15/musetalk.json")
     unet_model_path: str = os.getenv("MUSETALK_UNET_MODEL", "./models/musetalkV15/unet.pth")
     whisper_dir: str = os.getenv("MUSETALK_WHISPER_DIR", "./models/whisper")
@@ -65,6 +65,25 @@ class Settings:
 
 settings = Settings()
 logger = logging.getLogger("musetalk.api")
+
+
+def _resolve_vae_type(vae_type: str) -> str:
+    if vae_type:
+        candidate_path = Path(vae_type)
+        if candidate_path.is_absolute() and (candidate_path / "config.json").is_file():
+            return str(candidate_path)
+        model_path = PROJECT_DIR / "models" / vae_type
+        if (model_path / "config.json").is_file():
+            return str(model_path)
+        return vae_type
+    for candidate in ("sd-vae", "sd-vae-ft-mse"):
+        model_path = PROJECT_DIR / "models" / candidate
+        if (model_path / "config.json").is_file():
+            return str(model_path)
+    return "sd-vae-ft-mse"
+
+
+settings.vae_type = _resolve_vae_type(settings.vae_type)
 
 
 class LipSyncRequest(BaseModel):
@@ -1187,7 +1206,7 @@ if __name__ == "__main__":
     settings.unet_model_path = args.unet_model_path
     settings.unet_config = args.unet_config
     settings.whisper_dir = args.whisper_dir
-    settings.vae_type = args.vae_type
+    settings.vae_type = _resolve_vae_type(args.vae_type)
 
     import uvicorn
 

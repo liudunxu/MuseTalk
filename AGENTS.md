@@ -69,3 +69,7 @@ For multi-step tasks, state a brief plan:
 Strong success criteria let agents loop independently. Weak criteria like "make it work" require clarification.
 
 These guidelines are working if diffs contain fewer unnecessary changes, implementations avoid needless rewrites, and clarifying questions happen before mistakes rather than after them.
+
+## Repository Runtime Notes
+
+The API may be deployed from a server where the VAE weights directory is named `models/sd-vae-ft-mse` instead of `models/sd-vae`. Do not assume the local model directory name; resolve or validate the actual path before loading models.
