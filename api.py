@@ -1,5 +1,4 @@
 import argparse
-import copy
 import logging
 import math
 import mimetypes
@@ -39,7 +38,7 @@ from pydantic import BaseModel, Field
 from transformers import WhisperModel
 
 from musetalk.utils.audio_processor import AudioProcessor
-from musetalk.utils.blending import get_image
+from musetalk.utils.blending import get_image_blending, get_image_prepare_material
 from musetalk.utils.face_parsing import FaceParsing
 from musetalk.utils.utils import load_all_model
 
@@ -170,6 +169,11 @@ class LipSyncRequest(BaseModel):
     require_face_embedding: bool = True
     allow_crop_embedding_fallback: bool = True
     crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
+    temporal_tracking_weight: float = Field(0.08, ge=0.0, le=0.5)
+    target_fill_max_gap_seconds: float = Field(0.6, ge=0.0, le=3.0)
+    target_fill_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
+    target_fill_min_match_ratio: float = Field(0.55, ge=0.0, le=1.0)
+    target_fill_max_center_shift: float = Field(1.5, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
@@ -1237,6 +1241,8 @@ class MuseTalkApiRuntime:
         require_embedding: bool = False,
         allow_crop_embedding_fallback: bool = True,
         crop_embedding_min_detection_score: float = 0.0,
+        previous_bbox: Optional[Tuple[int, int, int, int]] = None,
+        temporal_tracking_weight: float = 0.0,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         face_boxes = self._detect_face_boxes(frame)
         if not face_boxes:
@@ -1285,7 +1291,8 @@ class MuseTalkApiRuntime:
                 if negative_descriptors
                 else 0.0
             )
-            score = 0.4 * avatar_score + 0.6 * identity_score
+            tracking_score = _box_iou(previous_bbox, bbox) if previous_bbox is not None else 0.0
+            score = 0.4 * avatar_score + 0.6 * identity_score + temporal_tracking_weight * tracking_score
             if score > best_score:
                 second_score = best_score
                 best_score = score
@@ -1398,7 +1405,13 @@ class MuseTalkApiRuntime:
         if float(best_cluster["avatar_score"]) < payload.similarity_threshold:
             return None
 
-        target_descriptors = list(best_cluster.get("descriptors") or [])
+        target_descriptors = [
+            descriptor
+            for descriptor in (best_cluster.get("descriptors") or [])
+            if self._descriptor_similarity(avatar_descriptor, descriptor) >= payload.similarity_threshold
+        ]
+        if not target_descriptors:
+            target_descriptors = list(best_cluster.get("descriptors") or [])
         negative_descriptors = []
         for cluster in clusters[1:]:
             descriptors = cluster.get("descriptors") or []
@@ -1426,6 +1439,97 @@ class MuseTalkApiRuntime:
         if settings.version == "v15":
             y2 = min(frame.shape[0], y2 + extra_margin)
         return _clip_box((x1, y1, x2, y2), frame.shape)
+
+    def _bbox_center_shift(
+        self,
+        left: Tuple[int, int, int, int],
+        right: Tuple[int, int, int, int],
+    ) -> float:
+        left_center = _box_center(left)
+        right_center = _box_center(right)
+        distance = math.hypot(left_center[0] - right_center[0], left_center[1] - right_center[1])
+        left_scale = math.sqrt(max(1, _box_area(left)))
+        right_scale = math.sqrt(max(1, _box_area(right)))
+        return distance / max(1.0, (left_scale + right_scale) / 2.0)
+
+    def _interpolate_bbox(
+        self,
+        left: Tuple[int, int, int, int],
+        right: Tuple[int, int, int, int],
+        ratio: float,
+        frame_shape: Tuple[int, int, int],
+    ) -> Optional[Tuple[int, int, int, int]]:
+        bbox = tuple(
+            int(round(left[index] + (right[index] - left[index]) * ratio))
+            for index in range(4)
+        )
+        return _clip_box(bbox, frame_shape)
+
+    def _fill_short_target_gaps(
+        self,
+        targets: List[Dict[str, object]],
+        fps: float,
+        frame_shape: Tuple[int, int, int],
+        max_gap_seconds: float,
+        window_seconds: float,
+        min_match_ratio: float,
+        max_center_shift: float,
+    ) -> int:
+        if not targets or max_gap_seconds <= 0.0:
+            return 0
+
+        max_gap_frames = max(1, int(round(max_gap_seconds * fps)))
+        window_frames = max(1, int(round(window_seconds * fps)))
+        original_matches = [target.get("bbox") is not None for target in targets]
+        filled = 0
+        index = 0
+        while index < len(targets):
+            if original_matches[index]:
+                index += 1
+                continue
+
+            gap_start = index
+            while index < len(targets) and not original_matches[index]:
+                index += 1
+            gap_end = index
+            gap_length = gap_end - gap_start
+            left_index = gap_start - 1
+            right_index = gap_end
+            if left_index < 0 or right_index >= len(targets):
+                continue
+            if gap_length > max_gap_frames:
+                continue
+
+            left_bbox = targets[left_index].get("bbox")
+            right_bbox = targets[right_index].get("bbox")
+            if left_bbox is None or right_bbox is None:
+                continue
+            if max_center_shift > 0.0 and self._bbox_center_shift(left_bbox, right_bbox) > max_center_shift:
+                continue
+
+            gap_center = (gap_start + gap_end) // 2
+            half_window = max(gap_length, window_frames // 2)
+            window_start = max(0, min(left_index, gap_center - half_window))
+            window_end = min(len(targets), max(right_index + 1, gap_center + half_window + 1))
+            match_count = sum(1 for matched in original_matches[window_start:window_end] if matched)
+            match_ratio = match_count / max(1, window_end - window_start)
+            if match_ratio < min_match_ratio:
+                continue
+
+            left_score = float(targets[left_index].get("score") or 0.0)
+            right_score = float(targets[right_index].get("score") or 0.0)
+            for fill_index in range(gap_start, gap_end):
+                ratio = (fill_index - left_index) / max(1, right_index - left_index)
+                bbox = self._interpolate_bbox(left_bbox, right_bbox, ratio, frame_shape)
+                if bbox is None:
+                    continue
+                targets[fill_index] = {
+                    "bbox": bbox,
+                    "score": min(left_score, right_score),
+                    "filled": True,
+                }
+                filled += 1
+        return filled
 
     def _encode_latents(
         self,
@@ -1456,8 +1560,13 @@ class MuseTalkApiRuntime:
         return latents_by_frame
 
     def _source_index_for_output(self, output_index: int, frame_count: int) -> int:
-        cycle = list(range(frame_count)) + list(range(frame_count - 1, -1, -1))
-        return cycle[output_index % len(cycle)]
+        if frame_count <= 1:
+            return 0
+        cycle_length = frame_count * 2
+        cycle_index = output_index % cycle_length
+        if cycle_index < frame_count:
+            return cycle_index
+        return cycle_length - cycle_index - 1
 
     def _run_inference_batches(
         self,
@@ -1499,6 +1608,7 @@ class MuseTalkApiRuntime:
     ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
         frame_count = len(frames)
+        blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
         for output_index in _progress(
             range(output_frame_count),
             "render frames",
@@ -1506,7 +1616,7 @@ class MuseTalkApiRuntime:
             unit="frame",
         ):
             source_index = self._source_index_for_output(output_index, frame_count)
-            original_frame = copy.deepcopy(frames[source_index])
+            original_frame = frames[source_index].copy()
             target = targets[source_index]
             bbox = target.get("bbox")
             result_frame = generated.get(output_index)
@@ -1522,28 +1632,35 @@ class MuseTalkApiRuntime:
 
             x1, y1, x2, y2 = crop_bbox
             try:
+                if source_index not in blend_materials:
+                    try:
+                        mask_array, crop_box = get_image_prepare_material(
+                            original_frame,
+                            [x1, y1, x2, y2],
+                            upper_boundary_ratio=blend_upper_boundary_ratio,
+                            fp=face_parser,
+                            mode=parsing_mode,
+                        )
+                        blend_materials[source_index] = (mask_array, tuple(crop_box))
+                    except Exception:
+                        blend_materials[source_index] = None
+                material = blend_materials[source_index]
+                if material is None:
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
                 resized = cv2.resize(
                     result_frame.astype(np.uint8),
                     (x2 - x1, y2 - y1),
                     interpolation=cv2.INTER_LANCZOS4,
                 )
-                if settings.version == "v15":
-                    combined = get_image(
-                        original_frame,
-                        resized,
-                        [x1, y1, x2, y2],
-                        upper_boundary_ratio=blend_upper_boundary_ratio,
-                        mode=parsing_mode,
-                        fp=face_parser,
-                    )
-                else:
-                    combined = get_image(
-                        original_frame,
-                        resized,
-                        [x1, y1, x2, y2],
-                        upper_boundary_ratio=blend_upper_boundary_ratio,
-                        fp=face_parser,
-                    )
+                mask_array, crop_box = material
+                combined = get_image_blending(
+                    original_frame,
+                    resized,
+                    [x1, y1, x2, y2],
+                    mask_array,
+                    crop_box,
+                )
             except Exception:
                 combined = original_frame
             cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), combined)
@@ -1619,6 +1736,7 @@ class MuseTalkApiRuntime:
             targets = []
             matched_source_frames = 0
             best_scores = []
+            previous_bbox = None
             for frame in _progress(frames, "match target", total=len(frames), unit="frame"):
                 if target_descriptors:
                     bbox, score = self._select_target_bbox(
@@ -1636,6 +1754,8 @@ class MuseTalkApiRuntime:
                         require_embedding=payload.require_face_embedding,
                         allow_crop_embedding_fallback=payload.allow_crop_embedding_fallback,
                         crop_embedding_min_detection_score=payload.crop_embedding_min_detection_score,
+                        previous_bbox=previous_bbox,
+                        temporal_tracking_weight=payload.temporal_tracking_weight,
                     )
                 else:
                     bbox, score = None, 0.0
@@ -1643,6 +1763,17 @@ class MuseTalkApiRuntime:
                 best_scores.append(score)
                 if bbox is not None:
                     matched_source_frames += 1
+                    previous_bbox = bbox
+
+            filled_source_frames = self._fill_short_target_gaps(
+                targets,
+                fps,
+                frames[0].shape if frames else (0, 0, 3),
+                payload.target_fill_max_gap_seconds,
+                payload.target_fill_window_seconds,
+                payload.target_fill_min_match_ratio,
+                payload.target_fill_max_center_shift,
+            )
 
             whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(str(paths["audio"]))
             if whisper_input_features is None:
@@ -1704,6 +1835,8 @@ class MuseTalkApiRuntime:
                 "source_frame_count": len(frames),
                 "output_frame_count": output_frame_count,
                 "matched_source_frames": matched_source_frames,
+                "filled_source_frames": filled_source_frames,
+                "matched_or_filled_source_frames": matched_source_frames + filled_source_frames,
                 "generated_output_frames": len(generated),
                 "skipped_output_frames": skipped_output_frames,
                 "best_similarity": max(best_scores) if best_scores else 0.0,
