@@ -1,11 +1,13 @@
 import argparse
 import copy
+import logging
 import math
 import mimetypes
 import os
 import shutil
 import subprocess
 import threading
+import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,8 +19,11 @@ import numpy as np
 import requests
 import torch
 from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.encoders import jsonable_encoder
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from transformers import WhisperModel
@@ -59,6 +64,7 @@ class Settings:
 
 
 settings = Settings()
+logger = logging.getLogger("musetalk.api")
 
 
 class LipSyncRequest(BaseModel):
@@ -82,6 +88,10 @@ class FaceListRequest(BaseModel):
     frame_sample_interval: int = Field(1, ge=1, le=300)
     max_frames: int = Field(0, ge=0, description="0 means scan all sampled frames")
     min_face_area: int = Field(400, ge=1)
+    min_detection_score: float = Field(0.85, ge=0.0, le=1.0)
+    require_landmark_match: bool = True
+    min_landmark_points: int = Field(8, ge=1, le=68)
+    min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     crop_padding: float = Field(0.25, ge=0.0, le=1.0)
 
 
@@ -94,6 +104,56 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.mount("/outputs", StaticFiles(directory=str(OUTPUT_ROOT)), name="outputs")
+
+
+@app.exception_handler(HTTPException)
+async def log_http_exception(request: Request, exc: HTTPException):
+    stack = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error(
+        "HTTP error while handling %s %s: %s\n%s",
+        request.method,
+        request.url,
+        exc.detail,
+        stack,
+    )
+    response = await http_exception_handler(request, exc)
+    if isinstance(response, JSONResponse):
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=jsonable_encoder({"detail": exc.detail, "traceback": stack}),
+            headers=exc.headers,
+        )
+    return response
+
+
+@app.exception_handler(RequestValidationError)
+async def log_validation_exception(request: Request, exc: RequestValidationError):
+    stack = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.error(
+        "Validation error while handling %s %s: %s\n%s",
+        request.method,
+        request.url,
+        exc.errors(),
+        stack,
+    )
+    return JSONResponse(
+        status_code=422,
+        content=jsonable_encoder({"detail": exc.errors(), "traceback": stack}),
+    )
+
+
+@app.exception_handler(Exception)
+async def log_unhandled_exception(request: Request, exc: Exception):
+    stack = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    logger.exception("Unhandled error while handling %s %s", request.method, request.url)
+    return JSONResponse(
+        status_code=500,
+        content=jsonable_encoder({
+            "detail": str(exc),
+            "error_type": type(exc).__name__,
+            "traceback": stack,
+        }),
+    )
 
 
 def _check_ffmpeg() -> bool:
@@ -212,6 +272,20 @@ def _box_area(bbox: Tuple[int, int, int, int]) -> int:
 def _box_center(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
     x1, y1, x2, y2 = bbox
     return (x1 + x2) / 2.0, (y1 + y2) / 2.0
+
+
+def _box_iou(left: Tuple[int, int, int, int], right: Tuple[int, int, int, int]) -> float:
+    lx1, ly1, lx2, ly2 = left
+    rx1, ry1, rx2, ry2 = right
+    inter_x1 = max(lx1, rx1)
+    inter_y1 = max(ly1, ry1)
+    inter_x2 = min(lx2, rx2)
+    inter_y2 = min(ly2, ry2)
+    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+    if inter_area == 0:
+        return 0.0
+    union_area = _box_area(left) + _box_area(right) - inter_area
+    return inter_area / union_area if union_area else 0.0
 
 
 def _normalize_vector(vector: np.ndarray) -> np.ndarray:
@@ -404,6 +478,88 @@ class MuseTalkApiRuntime:
 
         return {"hist": hist, "dct": _normalize_vector(dct)}
 
+    def _is_reasonable_face_box(
+        self,
+        bbox: Tuple[int, int, int, int],
+        frame_shape: Tuple[int, int, int],
+    ) -> bool:
+        width = bbox[2] - bbox[0]
+        height = bbox[3] - bbox[1]
+        if width <= 0 or height <= 0:
+            return False
+        aspect_ratio = width / height
+        area_ratio = _box_area(bbox) / max(1, frame_shape[0] * frame_shape[1])
+        if aspect_ratio < 0.45 or aspect_ratio > 1.8:
+            return False
+        if area_ratio > 0.85:
+            return False
+        return True
+
+    def _face_box_matches_landmarks(
+        self,
+        landmarks: List[np.ndarray],
+        bbox: Tuple[int, int, int, int],
+        frame_shape: Tuple[int, int, int],
+        min_points: int,
+        min_overlap: float,
+    ) -> bool:
+        if not landmarks:
+            return False
+
+        frame_height, frame_width = frame_shape[:2]
+        x1, y1, x2, y2 = bbox
+        width = x2 - x1
+        height = y2 - y1
+        pad_x = int(width * 0.35)
+        pad_y = int(height * 0.35)
+        expanded = _clip_box((x1 - pad_x, y1 - pad_y, x2 + pad_x, y2 + pad_y), frame_shape)
+        if expanded is None:
+            return False
+
+        ex1, ey1, ex2, ey2 = expanded
+        face_center = np.array(_box_center(bbox), dtype=np.float32)
+        face_scale = max(1.0, float(max(width, height)))
+
+        for landmark in landmarks:
+            points = np.asarray(landmark, dtype=np.float32).reshape(-1, 2)
+            valid_mask = (
+                (points[:, 0] > 1)
+                & (points[:, 0] < frame_width)
+                & (points[:, 1] > 1)
+                & (points[:, 1] < frame_height)
+            )
+            valid_points = points[valid_mask]
+            if len(valid_points) < min_points:
+                continue
+
+            inside_mask = (
+                (valid_points[:, 0] >= ex1)
+                & (valid_points[:, 0] <= ex2)
+                & (valid_points[:, 1] >= ey1)
+                & (valid_points[:, 1] <= ey2)
+            )
+            inside_points = valid_points[inside_mask]
+            if len(inside_points) < min_points:
+                continue
+
+            landmark_center = np.mean(inside_points, axis=0)
+            center_distance = np.linalg.norm(landmark_center - face_center) / face_scale
+            if center_distance > 0.75:
+                continue
+
+            landmark_bbox = (
+                int(np.min(inside_points[:, 0])),
+                int(np.min(inside_points[:, 1])),
+                int(np.max(inside_points[:, 0])),
+                int(np.max(inside_points[:, 1])),
+            )
+            overlap = _box_iou(bbox, landmark_bbox)
+            point_ratio = len(inside_points) / max(1, len(valid_points))
+            if overlap >= min_overlap or point_ratio >= 0.45:
+                return True
+
+        return False
+
     def _descriptor_similarity(self, left: Dict[str, np.ndarray], right: Dict[str, np.ndarray]) -> float:
         hist_score = cv2.compareHist(left["hist"], right["hist"], cv2.HISTCMP_CORREL)
         hist_score = float(np.clip((hist_score + 1.0) / 2.0, 0.0, 1.0))
@@ -456,6 +612,7 @@ class MuseTalkApiRuntime:
         bbox: Tuple[int, int, int, int],
         descriptor: Dict[str, np.ndarray],
         frame_index: int,
+        detection_score: float,
         similarity_threshold: float,
         crop_padding: float,
     ) -> None:
@@ -480,6 +637,7 @@ class MuseTalkApiRuntime:
                     "best_crop": crop,
                     "best_bbox": bbox,
                     "best_frame_index": frame_index,
+                    "best_detection_score": detection_score,
                     "count": 1,
                 }
             )
@@ -494,6 +652,7 @@ class MuseTalkApiRuntime:
             best_cluster["best_crop"] = crop
             best_cluster["best_bbox"] = bbox
             best_cluster["best_frame_index"] = frame_index
+            best_cluster["best_detection_score"] = detection_score
 
     def extract_distinct_faces(
         self,
@@ -507,6 +666,9 @@ class MuseTalkApiRuntime:
             clusters: List[Dict[str, object]] = []
             scanned_frames = 0
             detections = 0
+            rejected_low_score = 0
+            rejected_shape = 0
+            rejected_landmarks = 0
 
             for frame_index in range(0, len(frames), payload.frame_sample_interval):
                 if payload.max_frames and scanned_frames >= payload.max_frames:
@@ -514,11 +676,29 @@ class MuseTalkApiRuntime:
 
                 frame = frames[frame_index]
                 scanned_frames += 1
-                for bbox, _ in self._detect_face_boxes(frame):
+                landmarks = self._pose_face_landmarks(frame) if payload.require_landmark_match else []
+                for bbox, detection_score in self._detect_face_boxes(frame):
+                    if detection_score < payload.min_detection_score:
+                        rejected_low_score += 1
+                        continue
                     if _box_area(bbox) < payload.min_face_area:
+                        rejected_shape += 1
+                        continue
+                    if not self._is_reasonable_face_box(bbox, frame.shape):
+                        rejected_shape += 1
+                        continue
+                    if payload.require_landmark_match and not self._face_box_matches_landmarks(
+                        landmarks,
+                        bbox,
+                        frame.shape,
+                        payload.min_landmark_points,
+                        payload.min_landmark_overlap,
+                    ):
+                        rejected_landmarks += 1
                         continue
                     descriptor = self._face_descriptor(frame, bbox)
                     if descriptor is None:
+                        rejected_shape += 1
                         continue
                     detections += 1
                     self._add_face_to_clusters(
@@ -527,6 +707,7 @@ class MuseTalkApiRuntime:
                         bbox,
                         descriptor,
                         frame_index,
+                        detection_score,
                         payload.similarity_threshold,
                         payload.crop_padding,
                     )
@@ -546,6 +727,7 @@ class MuseTalkApiRuntime:
                         "path": face_path,
                         "max_area": int(cluster["max_area"]),
                         "frame_index": int(cluster["best_frame_index"]),
+                        "detection_score": float(cluster["best_detection_score"]),
                         "count": int(cluster["count"]),
                     }
                 )
@@ -556,6 +738,9 @@ class MuseTalkApiRuntime:
                 "source_frame_count": len(frames),
                 "scanned_frame_count": scanned_frames,
                 "detected_face_count": detections,
+                "rejected_low_score_count": rejected_low_score,
+                "rejected_shape_count": rejected_shape,
+                "rejected_landmark_count": rejected_landmarks,
             }
 
     def _select_target_bbox(
@@ -894,6 +1079,7 @@ def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str,
                 "url": face_url,
                 "max_area": item["max_area"],
                 "frame_index": item["frame_index"],
+                "detection_score": item["detection_score"],
                 "count": item["count"],
             }
         )
