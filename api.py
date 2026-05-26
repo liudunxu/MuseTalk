@@ -167,7 +167,7 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.55, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.52, ge=0.0, le=1.0)
     identity_margin: float = Field(0.0, ge=0.0, le=1.0)
     require_face_embedding: bool = True
     allow_crop_embedding_fallback: bool = True
@@ -175,9 +175,9 @@ class LipSyncRequest(BaseModel):
     temporal_tracking_weight: float = Field(0.08, ge=0.0, le=0.5)
     target_fill_max_gap_seconds: float = Field(0.6, ge=0.0, le=3.0)
     target_fill_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
-    target_fill_min_match_ratio: float = Field(0.45, ge=0.0, le=1.0)
+    target_fill_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
     target_fill_max_center_shift: float = Field(1.5, ge=0.0, le=5.0)
-    target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
+    target_bbox_smoothing_window: int = Field(5, ge=1, le=15)
     target_bbox_smoothing_max_center_shift: float = Field(0.75, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
@@ -190,7 +190,9 @@ class LipSyncRequest(BaseModel):
     extra_margin: int = Field(18, ge=0, le=100)
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
+    blend_mask_blur_ratio: float = Field(0.06, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.35, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.25, ge=0.0, le=1.0)
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -1800,6 +1802,13 @@ class MuseTalkApiRuntime:
         blended = image_float * (1.0 - strength) + matched * strength
         return np.clip(blended, 0, 255).astype(np.uint8)
 
+    def _sharpen_image(self, image: np.ndarray, strength: float) -> np.ndarray:
+        if strength <= 0.0 or image.size == 0:
+            return image
+        blurred = cv2.GaussianBlur(image, (0, 0), 1.0)
+        sharpened = cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
+        return np.clip(sharpened, 0, 255).astype(np.uint8)
+
     def _write_result_frames(
         self,
         frames: List[np.ndarray],
@@ -1810,7 +1819,9 @@ class MuseTalkApiRuntime:
         extra_margin: int,
         parsing_mode: str,
         blend_upper_boundary_ratio: float,
+        blend_mask_blur_ratio: float,
         color_match_strength: float,
+        mouth_sharpen_strength: float,
         face_parser: Optional[FaceParsing],
     ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1847,6 +1858,7 @@ class MuseTalkApiRuntime:
                             upper_boundary_ratio=blend_upper_boundary_ratio,
                             fp=face_parser,
                             mode=parsing_mode,
+                            mask_blur_ratio=blend_mask_blur_ratio,
                         )
                         blend_materials[source_index] = (mask_array, tuple(crop_box))
                     except Exception:
@@ -1862,6 +1874,7 @@ class MuseTalkApiRuntime:
                 )
                 reference_crop = original_frame[y1:y2, x1:x2]
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
+                resized = self._sharpen_image(resized, mouth_sharpen_strength)
                 mask_array, crop_box = material
                 combined = get_image_blending(
                     original_frame,
@@ -2062,7 +2075,9 @@ class MuseTalkApiRuntime:
                 payload.extra_margin,
                 payload.parsing_mode,
                 payload.blend_upper_boundary_ratio,
+                payload.blend_mask_blur_ratio,
                 payload.color_match_strength,
+                payload.mouth_sharpen_strength,
                 face_parser,
             )
 
