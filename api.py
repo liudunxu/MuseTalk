@@ -178,10 +178,11 @@ class LipSyncRequest(BaseModel):
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     bbox_shift: int = 0
-    extra_margin: int = Field(10, ge=0, le=80)
+    extra_margin: int = Field(18, ge=0, le=100)
     parsing_mode: str = "jaw"
-    left_cheek_width: int = Field(90, ge=1, le=240)
-    right_cheek_width: int = Field(90, ge=1, le=240)
+    blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
+    left_cheek_width: int = Field(75, ge=1, le=240)
+    right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
     audio_padding_length_left: int = Field(2, ge=0, le=10)
     audio_padding_length_right: int = Field(2, ge=0, le=10)
@@ -1493,6 +1494,7 @@ class MuseTalkApiRuntime:
         output_dir: Path,
         extra_margin: int,
         parsing_mode: str,
+        blend_upper_boundary_ratio: float,
         face_parser: Optional[FaceParsing],
     ) -> None:
         output_dir.mkdir(parents=True, exist_ok=True)
@@ -1520,17 +1522,28 @@ class MuseTalkApiRuntime:
 
             x1, y1, x2, y2 = crop_bbox
             try:
-                resized = cv2.resize(result_frame.astype(np.uint8), (x2 - x1, y2 - y1))
+                resized = cv2.resize(
+                    result_frame.astype(np.uint8),
+                    (x2 - x1, y2 - y1),
+                    interpolation=cv2.INTER_LANCZOS4,
+                )
                 if settings.version == "v15":
                     combined = get_image(
                         original_frame,
                         resized,
                         [x1, y1, x2, y2],
+                        upper_boundary_ratio=blend_upper_boundary_ratio,
                         mode=parsing_mode,
                         fp=face_parser,
                     )
                 else:
-                    combined = get_image(original_frame, resized, [x1, y1, x2, y2], fp=face_parser)
+                    combined = get_image(
+                        original_frame,
+                        resized,
+                        [x1, y1, x2, y2],
+                        upper_boundary_ratio=blend_upper_boundary_ratio,
+                        fp=face_parser,
+                    )
             except Exception:
                 combined = original_frame
             cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), combined)
@@ -1553,7 +1566,7 @@ class MuseTalkApiRuntime:
                 "-vf",
                 "format=yuv420p",
                 "-crf",
-                "18",
+                "15",
                 str(temp_video_path),
             ],
             check=True,
@@ -1673,6 +1686,7 @@ class MuseTalkApiRuntime:
                 render_dir,
                 payload.extra_margin,
                 payload.parsing_mode,
+                payload.blend_upper_boundary_ratio,
                 face_parser,
             )
 
