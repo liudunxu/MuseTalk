@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import threading
+import time
 import traceback
 import uuid
 from dataclasses import dataclass
@@ -70,6 +71,8 @@ class Settings:
     use_float16: bool = os.getenv("MUSETALK_USE_FLOAT16", "0").lower() in {"1", "true", "yes"}
     face_confidence: float = float(os.getenv("MUSETALK_FACE_CONFIDENCE", "0.5"))
     max_download_bytes: int = int(os.getenv("API_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
+    download_retries: int = int(os.getenv("API_DOWNLOAD_RETRIES", "2"))
+    download_retry_backoff_seconds: float = float(os.getenv("API_DOWNLOAD_RETRY_BACKOFF_SECONDS", "1.0"))
     face_embedding_backend: str = os.getenv("MUSETALK_FACE_EMBEDDING_BACKEND", "auto").lower()
     face_embedding_model: str = os.getenv("MUSETALK_FACE_EMBEDDING_MODEL", "buffalo_l")
     face_embedding_root: str = os.getenv(
@@ -293,6 +296,74 @@ def _validate_url(url: str) -> None:
         raise HTTPException(status_code=400, detail=f"Invalid URL: {url}")
 
 
+class _RetryableDownloadError(Exception):
+    pass
+
+
+def _download_attempt_count() -> int:
+    return max(1, settings.download_retries + 1)
+
+
+def _is_retryable_download_status(status_code: int) -> bool:
+    return status_code in {408, 425, 429} or 500 <= status_code < 600
+
+
+def _is_retryable_download_error(exc: Exception) -> bool:
+    if isinstance(exc, _RetryableDownloadError):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        response = getattr(exc, "response", None)
+        status_code = response.status_code if response is not None else None
+        return status_code is None or _is_retryable_download_status(status_code)
+    return isinstance(exc, requests.RequestException)
+
+
+def _download_retry_delay(attempt_index: int) -> float:
+    return max(0.0, settings.download_retry_backoff_seconds) * (2 ** attempt_index)
+
+
+def _get_download_response_once(url: str) -> requests.Response:
+    response = requests.get(url, stream=True, timeout=(10, 120))
+    if _is_retryable_download_status(response.status_code):
+        status_code = response.status_code
+        response.close()
+        raise _RetryableDownloadError(f"HTTP {status_code}")
+    response.raise_for_status()
+    return response
+
+
+def _get_download_response(url: str, label: str) -> requests.Response:
+    attempts = _download_attempt_count()
+    last_error = None
+    attempts_made = 0
+    for attempt_index in range(attempts):
+        attempts_made = attempt_index + 1
+        try:
+            return _get_download_response_once(url)
+        except _RetryableDownloadError as exc:
+            last_error = exc
+        except requests.RequestException as exc:
+            last_error = exc
+
+        if not _is_retryable_download_error(last_error):
+            break
+        if attempt_index >= attempts - 1:
+            break
+        logger.warning(
+            "Failed to download %s on attempt %s/%s: %s; retrying",
+            label,
+            attempt_index + 1,
+            attempts,
+            last_error,
+        )
+        time.sleep(_download_retry_delay(attempt_index))
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Failed to download {label} after {attempts_made} attempts: {last_error}",
+    )
+
+
 def _guess_suffix(url: str, content_type: str, allowed: set, fallback: str) -> str:
     suffix = Path(unquote(urlparse(url).path)).suffix.lower()
     if suffix in allowed:
@@ -316,32 +387,62 @@ def _download_to_file(url: str, dest_dir: Path, prefix: str, allowed: set, fallb
 
     _validate_url(url)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    try:
-        response = requests.get(url, stream=True, timeout=(10, 120))
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to download {prefix}: {exc}") from exc
+    attempts = _download_attempt_count()
+    last_error = None
+    attempts_made = 0
+    for attempt_index in range(attempts):
+        attempts_made = attempt_index + 1
+        response = None
+        temp_path = None
+        try:
+            response = _get_download_response_once(url)
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > settings.max_download_bytes:
+                raise HTTPException(status_code=413, detail=f"{prefix} is larger than API_MAX_DOWNLOAD_BYTES")
 
-    content_length = response.headers.get("content-length")
-    if content_length and int(content_length) > settings.max_download_bytes:
-        response.close()
-        raise HTTPException(status_code=413, detail=f"{prefix} is larger than API_MAX_DOWNLOAD_BYTES")
+            suffix = _guess_suffix(url, response.headers.get("content-type", ""), allowed, fallback)
+            output_path = dest_dir / f"{prefix}{suffix}"
+            temp_path = dest_dir / f"{prefix}{suffix}.part"
+            downloaded = 0
+            with temp_path.open("wb") as file_obj:
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if downloaded > settings.max_download_bytes:
+                        raise HTTPException(status_code=413, detail=f"{prefix} is larger than API_MAX_DOWNLOAD_BYTES")
+                    file_obj.write(chunk)
+            temp_path.replace(output_path)
+            return output_path
+        except HTTPException:
+            raise
+        except _RetryableDownloadError as exc:
+            last_error = exc
+        except (requests.RequestException, OSError) as exc:
+            last_error = exc
+        finally:
+            if response is not None:
+                response.close()
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
 
-    suffix = _guess_suffix(url, response.headers.get("content-type", ""), allowed, fallback)
-    output_path = dest_dir / f"{prefix}{suffix}"
-    downloaded = 0
-    try:
-        with output_path.open("wb") as file_obj:
-            for chunk in response.iter_content(chunk_size=1024 * 1024):
-                if not chunk:
-                    continue
-                downloaded += len(chunk)
-                if downloaded > settings.max_download_bytes:
-                    raise HTTPException(status_code=413, detail=f"{prefix} is larger than API_MAX_DOWNLOAD_BYTES")
-                file_obj.write(chunk)
-    finally:
-        response.close()
-    return output_path
+        if not _is_retryable_download_error(last_error):
+            break
+        if attempt_index >= attempts - 1:
+            break
+        logger.warning(
+            "Failed to download %s on attempt %s/%s: %s; retrying",
+            prefix,
+            attempt_index + 1,
+            attempts,
+            last_error,
+        )
+        time.sleep(_download_retry_delay(attempt_index))
+
+    raise HTTPException(
+        status_code=400,
+        detail=f"Failed to download {prefix} after {attempts_made} attempts: {last_error}",
+    )
 
 
 def _read_video_frames(video_path: Path) -> Tuple[List[np.ndarray], float]:
@@ -1394,7 +1495,13 @@ class MuseTalkApiRuntime:
                 )
 
         if not clusters:
-            return None
+            return {
+                "avatar_score": 0.0,
+                "count": 0,
+                "target_descriptors": [],
+                "negative_descriptors": [],
+                "no_face_detected": True,
+            }
 
         if avatar_descriptor is None:
             clusters.sort(
@@ -1818,7 +1925,7 @@ class MuseTalkApiRuntime:
 
     @torch.no_grad()
     def synthesize(self, payload: LipSyncRequest, paths: Dict[str, Path], job_output_dir: Path) -> Dict[str, object]:
-        self.load()
+        self.load_detectors()
         with self.run_lock:
             frames, fps = _read_video_frames(paths["video"])
             avatar_descriptor = self._avatar_descriptor(paths["avatar"]) if paths.get("avatar") else None
@@ -1834,6 +1941,24 @@ class MuseTalkApiRuntime:
                     detail = f"{detail} InsightFace loaded, but did not detect a face in the avatar image."
                 raise RuntimeError(detail)
             target_identity = self._find_target_identity(frames, fps, avatar_descriptor, payload)
+            if target_identity and target_identity.get("no_face_detected"):
+                return {
+                    "passthrough": True,
+                    "passthrough_reason": "no_face_detected",
+                    "source_frame_count": len(frames),
+                    "output_frame_count": len(frames),
+                    "matched_source_frames": 0,
+                    "filled_source_frames": 0,
+                    "smoothed_source_frames": 0,
+                    "matched_or_filled_source_frames": 0,
+                    "generated_output_frames": 0,
+                    "skipped_output_frames": len(frames),
+                    "best_similarity": 0.0,
+                    "target_identity_similarity": 0.0,
+                    "target_identity_count": 0,
+                    "target_identity_source": "none",
+                    "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
+                }
             target_descriptors = target_identity.get("target_descriptors") if target_identity else []
             negative_descriptors = target_identity.get("negative_descriptors") if target_identity else []
             target_identity_score = (
@@ -1893,6 +2018,7 @@ class MuseTalkApiRuntime:
                 payload.target_bbox_smoothing_max_center_shift,
             )
 
+            self.load()
             whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(str(paths["audio"]))
             if whisper_input_features is None:
                 raise RuntimeError(f"Could not read audio: {paths['audio']}")
@@ -2080,8 +2206,11 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
-    output_path = result.pop("output_path")
-    video_url = _output_url(request, output_path)
+    if result.get("passthrough"):
+        video_url = payload.video_url
+    else:
+        output_path = result.pop("output_path")
+        video_url = _output_url(request, output_path)
     return {
         "job_id": job_id,
         "video_url": video_url,
@@ -2102,10 +2231,9 @@ def download_by_url(url: str = Query(..., description="Generated or remote video
 
     _validate_url(url)
     try:
-        response = requests.get(url, stream=True, timeout=(10, 120))
-        response.raise_for_status()
-    except requests.RequestException as exc:
-        raise HTTPException(status_code=400, detail=f"Failed to download URL: {exc}") from exc
+        response = _get_download_response(url, "URL")
+    except HTTPException:
+        raise
 
     filename = Path(unquote(urlparse(url).path)).name or "download.mp4"
     media_type = response.headers.get("content-type", "application/octet-stream")
