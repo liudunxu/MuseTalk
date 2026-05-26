@@ -162,9 +162,9 @@ settings.whisper_dir = _resolve_model_dir(
 
 class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
-    avatar_url: str = Field(..., description="Reference avatar image URL")
+    avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.58, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.55, ge=0.0, le=1.0)
     identity_margin: float = Field(0.0, ge=0.0, le=1.0)
     require_face_embedding: bool = True
     allow_crop_embedding_fallback: bool = True
@@ -172,7 +172,7 @@ class LipSyncRequest(BaseModel):
     temporal_tracking_weight: float = Field(0.08, ge=0.0, le=0.5)
     target_fill_max_gap_seconds: float = Field(0.6, ge=0.0, le=3.0)
     target_fill_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
-    target_fill_min_match_ratio: float = Field(0.55, ge=0.0, le=1.0)
+    target_fill_min_match_ratio: float = Field(0.45, ge=0.0, le=1.0)
     target_fill_max_center_shift: float = Field(1.5, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
@@ -1180,7 +1180,10 @@ class MuseTalkApiRuntime:
                         payload.crop_padding,
                     )
 
-            clusters.sort(key=lambda item: int(item["max_area"]), reverse=True)
+            clusters.sort(
+                key=lambda item: (int(item["count"]), int(item["max_area"])),
+                reverse=True,
+            )
             faces_dir = output_dir / "faces"
             faces_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1228,7 +1231,7 @@ class MuseTalkApiRuntime:
     def _select_target_bbox(
         self,
         frame: np.ndarray,
-        avatar_descriptor: Dict[str, np.ndarray],
+        avatar_descriptor: Optional[Dict[str, np.ndarray]],
         threshold: float,
         bbox_shift: int,
         identity_margin: float,
@@ -1278,14 +1281,18 @@ class MuseTalkApiRuntime:
                 continue
             if require_embedding and "embedding" not in descriptor:
                 continue
-            avatar_score = self._descriptor_similarity(avatar_descriptor, descriptor)
-            if require_embedding and avatar_score < threshold:
-                continue
             identity_score = (
                 max(self._descriptor_similarity(expected, descriptor) for expected in expected_descriptors)
                 if expected_descriptors
-                else avatar_score
+                else 0.0
             )
+            avatar_score = (
+                self._descriptor_similarity(avatar_descriptor, descriptor)
+                if avatar_descriptor is not None
+                else identity_score
+            )
+            if require_embedding and avatar_score < threshold:
+                continue
             negative_score = (
                 max(self._descriptor_similarity(negative, descriptor) for negative in negative_descriptors)
                 if negative_descriptors
@@ -1325,7 +1332,7 @@ class MuseTalkApiRuntime:
         self,
         frames: List[np.ndarray],
         fps: float,
-        avatar_descriptor: Dict[str, np.ndarray],
+        avatar_descriptor: Optional[Dict[str, np.ndarray]],
         payload: LipSyncRequest,
     ) -> Optional[Dict[str, object]]:
         clusters: List[Dict[str, object]] = []
@@ -1385,6 +1392,20 @@ class MuseTalkApiRuntime:
 
         if not clusters:
             return None
+
+        if avatar_descriptor is None:
+            clusters.sort(
+                key=lambda item: (int(item["count"]), int(item["max_area"])),
+                reverse=True,
+            )
+            best_cluster = clusters[0]
+            best_cluster["avatar_score"] = 0.0
+            best_cluster["target_descriptors"] = list(best_cluster.get("descriptors") or [])
+            negative_descriptors = []
+            for cluster in clusters[1:]:
+                negative_descriptors.extend(cluster.get("descriptors") or [])
+            best_cluster["negative_descriptors"] = negative_descriptors
+            return best_cluster
 
         for cluster in clusters:
             descriptors = cluster.get("descriptors") or []
@@ -1719,8 +1740,12 @@ class MuseTalkApiRuntime:
         self.load()
         with self.run_lock:
             frames, fps = _read_video_frames(paths["video"])
-            avatar_descriptor = self._avatar_descriptor(paths["avatar"])
-            if payload.require_face_embedding and "embedding" not in avatar_descriptor:
+            avatar_descriptor = self._avatar_descriptor(paths["avatar"]) if paths.get("avatar") else None
+            if (
+                avatar_descriptor is not None
+                and payload.require_face_embedding
+                and "embedding" not in avatar_descriptor
+            ):
                 detail = "Face embedding is required for /api/lipsync, but the avatar image did not produce one."
                 if self.face_embedding_error:
                     detail = f"{detail} InsightFace error: {self.face_embedding_error}"
@@ -1730,8 +1755,14 @@ class MuseTalkApiRuntime:
             target_identity = self._find_target_identity(frames, fps, avatar_descriptor, payload)
             target_descriptors = target_identity.get("target_descriptors") if target_identity else []
             negative_descriptors = target_identity.get("negative_descriptors") if target_identity else []
-            target_identity_score = float(target_identity["avatar_score"]) if target_identity else 0.0
-            face_identity_backend = "embedding" if "embedding" in avatar_descriptor else "visual"
+            target_identity_score = (
+                float(target_identity["avatar_score"])
+                if target_identity and avatar_descriptor is not None
+                else 0.0
+            )
+            target_identity_count = int(target_identity["count"]) if target_identity else 0
+            face_identity_backend = "embedding" if payload.require_face_embedding else "visual"
+            target_identity_source = "avatar" if avatar_descriptor is not None else "most_frequent_face"
 
             targets = []
             matched_source_frames = 0
@@ -1841,6 +1872,8 @@ class MuseTalkApiRuntime:
                 "skipped_output_frames": skipped_output_frames,
                 "best_similarity": max(best_scores) if best_scores else 0.0,
                 "target_identity_similarity": target_identity_score,
+                "target_identity_count": target_identity_count,
+                "target_identity_source": target_identity_source,
                 "face_identity_backend": face_identity_backend,
             }
 
@@ -1937,13 +1970,20 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
     job_output_dir.mkdir(parents=True, exist_ok=True)
 
     video_path = _download_to_file(payload.video_url, job_input_dir, "video", VIDEO_SUFFIXES, ".mp4")
-    avatar_path = _download_to_file(payload.avatar_url, job_input_dir, "avatar", IMAGE_SUFFIXES, ".jpg")
     audio_path = _download_to_file(payload.audio_url, job_input_dir, "audio", AUDIO_SUFFIXES, ".wav")
+    avatar_path = (
+        _download_to_file(payload.avatar_url, job_input_dir, "avatar", IMAGE_SUFFIXES, ".jpg")
+        if payload.avatar_url
+        else None
+    )
 
     try:
+        input_paths = {"video": video_path, "audio": audio_path}
+        if avatar_path is not None:
+            input_paths["avatar"] = avatar_path
         result = runtime.synthesize(
             payload,
-            {"video": video_path, "avatar": avatar_path, "audio": audio_path},
+            input_paths,
             job_output_dir,
         )
     except HTTPException:
