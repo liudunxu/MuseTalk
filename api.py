@@ -762,7 +762,29 @@ class MuseTalkApiRuntime:
                 features.append(hist)
         return _normalize_vector(np.concatenate(features))
 
-    def _face_descriptor(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[Dict[str, np.ndarray]]:
+    def _descriptor_embedding(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        crop: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        embedding_crop = self._crop_face(frame, bbox, 0.25)
+        if embedding_crop is None:
+            embedding_crop = crop
+
+        embedding = self._face_embedding(embedding_crop)
+        if embedding is None:
+            embedding = self._crop_face_embedding(embedding_crop)
+        if embedding is None:
+            embedding = self._face_embedding(frame, bbox)
+        return embedding
+
+    def _face_descriptor(
+        self,
+        frame: np.ndarray,
+        bbox: Tuple[int, int, int, int],
+        embedding_only: bool = False,
+    ) -> Optional[Dict[str, np.ndarray]]:
         clipped = _clip_box(bbox, frame.shape)
         if clipped is None:
             return None
@@ -770,9 +792,9 @@ class MuseTalkApiRuntime:
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             return None
-        embedding_crop = self._crop_face(frame, bbox, 0.25)
-        if embedding_crop is None:
-            embedding_crop = crop
+        embedding = self._descriptor_embedding(frame, clipped, crop)
+        if embedding_only:
+            return {"embedding": embedding} if embedding is not None else None
 
         crop = cv2.resize(crop, (112, 112), interpolation=cv2.INTER_AREA)
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
@@ -795,11 +817,6 @@ class MuseTalkApiRuntime:
             "lbp": lbp,
             "grad": grad,
         }
-        embedding = self._face_embedding(embedding_crop)
-        if embedding is None:
-            embedding = self._crop_face_embedding(embedding_crop)
-        if embedding is None:
-            embedding = self._face_embedding(frame, clipped)
         if embedding is not None:
             descriptor["embedding"] = embedding
         return descriptor
@@ -1122,7 +1139,11 @@ class MuseTalkApiRuntime:
                         if payload.require_landmark_match:
                             rejected_landmarks += 1
                         continue
-                    descriptor = self._face_descriptor(frame, bbox)
+                    descriptor = self._face_descriptor(
+                        frame,
+                        bbox,
+                        embedding_only=payload.require_face_embedding,
+                    )
                     if descriptor is None:
                         rejected_shape += 1
                         continue
@@ -1205,7 +1226,6 @@ class MuseTalkApiRuntime:
         if not face_boxes:
             return None, 0.0
 
-        landmarks = self._pose_face_landmarks(frame) if require_landmark_match else []
         best_bbox = None
         best_score = -1.0
         best_identity_score = -1.0
@@ -1217,13 +1237,17 @@ class MuseTalkApiRuntime:
                 bbox,
                 detection_score,
                 min_detection_score,
-                landmarks,
-                require_landmark_match,
+                [],
+                False,
                 min_landmark_points,
                 min_landmark_overlap,
             ):
                 continue
-            descriptor = self._face_descriptor(frame, bbox)
+            descriptor = self._face_descriptor(
+                frame,
+                bbox,
+                embedding_only=require_embedding,
+            )
             if descriptor is None:
                 continue
             if require_embedding and "embedding" not in descriptor:
@@ -1258,6 +1282,15 @@ class MuseTalkApiRuntime:
         if second_score >= 0.0 and best_score < second_score + identity_margin:
             return None, max(0.0, best_score)
 
+        landmarks = self._pose_face_landmarks(frame) if require_landmark_match else []
+        if require_landmark_match and not self._face_box_matches_landmarks(
+            landmarks,
+            best_bbox,
+            frame.shape,
+            min_landmark_points,
+            min_landmark_overlap,
+        ):
+            return None, max(0.0, best_score)
         target_bbox = self._landmark_bbox_for_face(landmarks, best_bbox, bbox_shift, frame.shape)
         return target_bbox, best_score
 
@@ -1299,7 +1332,11 @@ class MuseTalkApiRuntime:
                     payload.min_landmark_overlap,
                 ):
                     continue
-                descriptor = self._face_descriptor(frame, bbox)
+                descriptor = self._face_descriptor(
+                    frame,
+                    bbox,
+                    embedding_only=payload.require_face_embedding,
+                )
                 if descriptor is None:
                     continue
                 if payload.require_face_embedding and "embedding" not in descriptor:
