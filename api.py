@@ -168,7 +168,8 @@ class LipSyncRequest(BaseModel):
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
     similarity_threshold: float = Field(0.52, ge=0.0, le=1.0)
-    identity_margin: float = Field(0.0, ge=0.0, le=1.0)
+    identity_margin: float = Field(0.05, ge=0.0, le=1.0)
+    identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     require_face_embedding: bool = True
     allow_crop_embedding_fallback: bool = True
     crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
@@ -1492,7 +1493,7 @@ class MuseTalkApiRuntime:
                     descriptor,
                     frame_index,
                     detection_score,
-                    payload.similarity_threshold,
+                    payload.identity_cluster_threshold,
                     0.0,
                 )
 
@@ -1547,17 +1548,7 @@ class MuseTalkApiRuntime:
             target_descriptors = list(best_cluster.get("descriptors") or [])
         negative_descriptors = []
         for cluster in clusters[1:]:
-            descriptors = cluster.get("descriptors") or []
-            target_score = max(
-                self._descriptor_similarity(target_descriptor, descriptor)
-                for target_descriptor in target_descriptors
-                for descriptor in descriptors
-            )
-            avatar_score = float(cluster["avatar_score"])
-            if avatar_score >= payload.similarity_threshold and target_score >= payload.similarity_threshold:
-                target_descriptors.extend(descriptors)
-            else:
-                negative_descriptors.extend(descriptors)
+            negative_descriptors.extend(cluster.get("descriptors") or [])
         best_cluster["target_descriptors"] = target_descriptors
         best_cluster["negative_descriptors"] = negative_descriptors
         return best_cluster
