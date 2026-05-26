@@ -165,13 +165,13 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: str = Field(..., description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.78, ge=0.0, le=1.0)
-    identity_margin: float = Field(0.12, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.68, ge=0.0, le=1.0)
+    identity_margin: float = Field(0.04, ge=0.0, le=1.0)
     require_face_embedding: bool = True
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
-    min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
+    min_detection_score: float = Field(0.7, ge=0.0, le=1.0)
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
@@ -1290,7 +1290,7 @@ class MuseTalkApiRuntime:
             min_landmark_points,
             min_landmark_overlap,
         ):
-            return None, max(0.0, best_score)
+            landmarks = []
         target_bbox = self._landmark_bbox_for_face(landmarks, best_bbox, bbox_shift, frame.shape)
         return target_bbox, best_score
 
