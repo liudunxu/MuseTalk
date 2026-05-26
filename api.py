@@ -168,6 +168,9 @@ class LipSyncRequest(BaseModel):
     similarity_threshold: float = Field(0.78, ge=0.0, le=1.0)
     identity_margin: float = Field(0.12, ge=0.0, le=1.0)
     require_face_embedding: bool = True
+    identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
+    identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
+    identity_scan_require_landmark_match: bool = False
     min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
@@ -1261,18 +1264,29 @@ class MuseTalkApiRuntime:
     def _find_target_identity(
         self,
         frames: List[np.ndarray],
+        fps: float,
         avatar_descriptor: Dict[str, np.ndarray],
         payload: LipSyncRequest,
     ) -> Optional[Dict[str, object]]:
         clusters: List[Dict[str, object]] = []
+        sample_interval = payload.identity_scan_interval or max(1, int(round(fps / 2.0)))
+        frame_indices = range(0, len(frames), sample_interval)
+        total_scan_frames = len(frame_indices)
+        if payload.identity_scan_max_frames:
+            total_scan_frames = min(total_scan_frames, payload.identity_scan_max_frames)
 
-        for frame_index, frame in _progress(
-            enumerate(frames),
+        scanned_identity_frames = 0
+        for frame_index in _progress(
+            frame_indices,
             "scan identity",
-            total=len(frames),
+            total=total_scan_frames,
             unit="frame",
         ):
-            landmarks = self._pose_face_landmarks(frame) if payload.require_landmark_match else []
+            if payload.identity_scan_max_frames and scanned_identity_frames >= payload.identity_scan_max_frames:
+                break
+            frame = frames[frame_index]
+            scanned_identity_frames += 1
+            landmarks = self._pose_face_landmarks(frame) if payload.identity_scan_require_landmark_match else []
             for bbox, detection_score in self._detect_face_boxes(frame):
                 if not self._passes_face_filters(
                     frame,
@@ -1280,7 +1294,7 @@ class MuseTalkApiRuntime:
                     detection_score,
                     payload.min_detection_score,
                     landmarks,
-                    payload.require_landmark_match,
+                    payload.identity_scan_require_landmark_match,
                     payload.min_landmark_points,
                     payload.min_landmark_overlap,
                 ):
@@ -1523,7 +1537,7 @@ class MuseTalkApiRuntime:
                 else:
                     detail = f"{detail} InsightFace loaded, but did not detect a face in the avatar image."
                 raise RuntimeError(detail)
-            target_identity = self._find_target_identity(frames, avatar_descriptor, payload)
+            target_identity = self._find_target_identity(frames, fps, avatar_descriptor, payload)
             target_descriptors = target_identity.get("target_descriptors") if target_identity else []
             negative_descriptors = target_identity.get("negative_descriptors") if target_identity else []
             target_identity_score = float(target_identity["avatar_score"]) if target_identity else 0.0
