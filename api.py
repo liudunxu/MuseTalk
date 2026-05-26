@@ -10,7 +10,7 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import cv2
 import numpy as np
@@ -130,6 +130,16 @@ def _guess_suffix(url: str, content_type: str, allowed: set, fallback: str) -> s
 
 
 def _download_to_file(url: str, dest_dir: Path, prefix: str, allowed: set, fallback: str) -> Path:
+    local_path = _local_output_from_url(url)
+    if local_path is not None:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        suffix = local_path.suffix.lower()
+        if suffix not in allowed:
+            suffix = fallback
+        output_path = dest_dir / f"{prefix}{suffix}"
+        shutil.copyfile(local_path, output_path)
+        return output_path
+
     _validate_url(url)
     dest_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -831,9 +841,15 @@ def _output_url(request: Request, output_path: Path) -> str:
 
 def _local_output_from_url(url: str) -> Optional[Path]:
     parsed = urlparse(url)
-    if not parsed.path.startswith("/outputs/"):
+    path = parsed.path
+    if path == "/api/download":
+        query_url = parse_qs(parsed.query).get("url", [""])[0]
+        if query_url:
+            return _local_output_from_url(query_url)
+
+    if not path.startswith("/outputs/"):
         return None
-    relative = unquote(parsed.path[len("/outputs/"):]).lstrip("/")
+    relative = unquote(path[len("/outputs/"):]).lstrip("/")
     candidate = (OUTPUT_ROOT / relative).resolve()
     try:
         candidate.relative_to(OUTPUT_ROOT.resolve())
