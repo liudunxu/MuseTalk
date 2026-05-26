@@ -616,11 +616,15 @@ class MuseTalkApiRuntime:
         clipped = _clip_box(landmark_bbox, frame_shape)
         return clipped if clipped is not None else detector_bbox
 
-    def _face_embedding(self, crop: np.ndarray) -> Optional[np.ndarray]:
-        if self.face_embedder is None or crop.size == 0:
+    def _face_embedding(
+        self,
+        image: np.ndarray,
+        reference_bbox: Optional[Tuple[int, int, int, int]] = None,
+    ) -> Optional[np.ndarray]:
+        if self.face_embedder is None or image.size == 0:
             return None
         try:
-            faces = self.face_embedder.get(crop)
+            faces = self.face_embedder.get(image)
         except Exception as exc:
             self.face_embedding_error = str(exc)
             return None
@@ -631,12 +635,18 @@ class MuseTalkApiRuntime:
             bbox = getattr(face, "bbox", None)
             if bbox is None:
                 area = 1.0
+                overlap = 0.0
             else:
                 x1, y1, x2, y2 = bbox
                 area = max(1.0, float((x2 - x1) * (y2 - y1)))
-            return float(getattr(face, "det_score", 1.0)) * area
+                overlap = _box_iou(tuple(bbox), reference_bbox) if reference_bbox else 0.0
+            return (overlap * 1000.0 + 1.0) * float(getattr(face, "det_score", 1.0)) * area
 
         face = max(faces, key=face_weight)
+        if reference_bbox is not None:
+            bbox = getattr(face, "bbox", None)
+            if bbox is None or _box_iou(tuple(bbox), reference_bbox) <= 0.0:
+                return None
         embedding = getattr(face, "normed_embedding", None)
         if embedding is None:
             return None
@@ -731,6 +741,8 @@ class MuseTalkApiRuntime:
             "grad": grad,
         }
         embedding = self._face_embedding(embedding_crop)
+        if embedding is None:
+            embedding = self._face_embedding(frame, clipped)
         if embedding is not None:
             descriptor["embedding"] = embedding
         return descriptor
@@ -861,6 +873,11 @@ class MuseTalkApiRuntime:
         descriptor = self._face_descriptor(avatar, boxes[0][0])
         if descriptor is None:
             raise RuntimeError("Could not build avatar face descriptor.")
+        if "embedding" not in descriptor and self.face_embedder is not None:
+            height, width = avatar.shape[:2]
+            full_descriptor = self._face_descriptor(avatar, (0, 0, width, height))
+            if full_descriptor is not None and "embedding" in full_descriptor:
+                return full_descriptor
         return descriptor
 
     def _passes_face_filters(
@@ -1390,6 +1407,8 @@ class MuseTalkApiRuntime:
                 detail = "Face embedding is required for /api/lipsync, but the avatar image did not produce one."
                 if self.face_embedding_error:
                     detail = f"{detail} InsightFace error: {self.face_embedding_error}"
+                else:
+                    detail = f"{detail} InsightFace loaded, but did not detect a face in the avatar image."
                 raise RuntimeError(detail)
             target_identity = self._find_target_identity(frames, avatar_descriptor, payload)
             target_descriptors = target_identity.get("target_descriptors") if target_identity else []
