@@ -83,7 +83,32 @@ def _resolve_vae_type(vae_type: str) -> str:
     return "sd-vae-ft-mse"
 
 
+def _resolve_model_file(path_value: str, candidates: List[str]) -> str:
+    if path_value:
+        path = Path(path_value)
+        if path.is_absolute() and path.is_file():
+            return str(path)
+        repo_path = PROJECT_DIR / path_value
+        if repo_path.is_file():
+            return str(repo_path)
+
+    for candidate in candidates:
+        candidate_path = PROJECT_DIR / candidate
+        if candidate_path.is_file():
+            return str(candidate_path)
+
+    return str(PROJECT_DIR / candidates[0])
+
+
 settings.vae_type = _resolve_vae_type(settings.vae_type)
+settings.unet_config = _resolve_model_file(
+    settings.unet_config,
+    ["models/musetalkV15/musetalk.json", "models/musetalk/musetalk.json"],
+)
+settings.unet_model_path = _resolve_model_file(
+    settings.unet_model_path,
+    ["models/musetalkV15/unet.pth", "models/musetalk/pytorch_model.bin"],
+)
 
 
 class LipSyncRequest(BaseModel):
@@ -1203,8 +1228,14 @@ if __name__ == "__main__":
     settings.ffmpeg_path = args.ffmpeg_path
     settings.gpu_id = args.gpu_id
     settings.use_float16 = args.use_float16
-    settings.unet_model_path = args.unet_model_path
-    settings.unet_config = args.unet_config
+    settings.unet_model_path = _resolve_model_file(
+        args.unet_model_path,
+        ["models/musetalkV15/unet.pth", "models/musetalk/pytorch_model.bin"],
+    )
+    settings.unet_config = _resolve_model_file(
+        args.unet_config,
+        ["models/musetalkV15/musetalk.json", "models/musetalk/musetalk.json"],
+    )
     settings.whisper_dir = args.whisper_dir
     settings.vae_type = _resolve_vae_type(args.vae_type)
 
