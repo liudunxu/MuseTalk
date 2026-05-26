@@ -65,6 +65,13 @@ class Settings:
     use_float16: bool = os.getenv("MUSETALK_USE_FLOAT16", "0").lower() in {"1", "true", "yes"}
     face_confidence: float = float(os.getenv("MUSETALK_FACE_CONFIDENCE", "0.5"))
     max_download_bytes: int = int(os.getenv("API_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
+    face_embedding_backend: str = os.getenv("MUSETALK_FACE_EMBEDDING_BACKEND", "auto").lower()
+    face_embedding_model: str = os.getenv("MUSETALK_FACE_EMBEDDING_MODEL", "buffalo_l")
+    face_embedding_root: str = os.getenv(
+        "MUSETALK_FACE_EMBEDDING_ROOT",
+        str(PROJECT_DIR / "models" / "insightface"),
+    )
+    face_embedding_det_size: int = int(os.getenv("MUSETALK_FACE_EMBEDDING_DET_SIZE", "640"))
 
 
 settings = Settings()
@@ -151,7 +158,8 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: str = Field(..., description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.62, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.72, ge=0.0, le=1.0)
+    identity_margin: float = Field(0.07, ge=0.0, le=1.0)
     min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
@@ -386,6 +394,9 @@ class MuseTalkApiRuntime:
         self.load_lock = threading.RLock()
         self.run_lock = threading.Lock()
         self.face_parser_cache: Dict[Tuple[int, int], FaceParsing] = {}
+        self.face_embedder = None
+        self.face_embedding_loaded = False
+        self.face_embedding_error = ""
 
     def load_detectors(self) -> None:
         if self.detectors_loaded:
@@ -402,7 +413,46 @@ class MuseTalkApiRuntime:
             self.face_alignment = preprocessing_module.fa
             self.pose_model = preprocessing_module.model
             self.coord_placeholder = preprocessing_module.coord_placeholder
+            self._load_face_embedder()
             self.detectors_loaded = True
+
+    def _load_face_embedder(self) -> None:
+        if self.face_embedding_loaded:
+            return
+        backend = settings.face_embedding_backend
+        if backend in {"0", "false", "no", "off", "none"}:
+            self.face_embedding_loaded = True
+            return
+
+        model_dir = Path(settings.face_embedding_root) / "models" / settings.face_embedding_model
+        if backend == "auto" and not model_dir.exists():
+            self.face_embedding_error = f"InsightFace model directory not found: {model_dir}"
+            self.face_embedding_loaded = True
+            return
+
+        try:
+            from insightface.app import FaceAnalysis
+
+            providers = (
+                ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                if torch.cuda.is_available()
+                else ["CPUExecutionProvider"]
+            )
+            self.face_embedder = FaceAnalysis(
+                name=settings.face_embedding_model,
+                root=settings.face_embedding_root,
+                providers=providers,
+            )
+            ctx_id = settings.gpu_id if torch.cuda.is_available() else -1
+            det_size = (settings.face_embedding_det_size, settings.face_embedding_det_size)
+            self.face_embedder.prepare(ctx_id=ctx_id, det_size=det_size)
+        except Exception as exc:
+            self.face_embedding_error = str(exc)
+            self.face_embedder = None
+            if backend in {"insightface", "required"}:
+                raise RuntimeError(f"Failed to load InsightFace embedding backend: {exc}") from exc
+        finally:
+            self.face_embedding_loaded = True
 
     def load(self) -> None:
         if self.loaded:
@@ -545,6 +595,87 @@ class MuseTalkApiRuntime:
         clipped = _clip_box(landmark_bbox, frame_shape)
         return clipped if clipped is not None else detector_bbox
 
+    def _face_embedding(self, crop: np.ndarray) -> Optional[np.ndarray]:
+        if self.face_embedder is None or crop.size == 0:
+            return None
+        try:
+            faces = self.face_embedder.get(crop)
+        except Exception as exc:
+            self.face_embedding_error = str(exc)
+            return None
+        if not faces:
+            return None
+
+        def face_weight(face) -> float:
+            bbox = getattr(face, "bbox", None)
+            if bbox is None:
+                area = 1.0
+            else:
+                x1, y1, x2, y2 = bbox
+                area = max(1.0, float((x2 - x1) * (y2 - y1)))
+            return float(getattr(face, "det_score", 1.0)) * area
+
+        face = max(faces, key=face_weight)
+        embedding = getattr(face, "normed_embedding", None)
+        if embedding is None:
+            return None
+        return _normalize_vector(np.asarray(embedding, dtype=np.float32))
+
+    def _spatial_histogram(self, hsv: np.ndarray, grid_size: int = 3) -> np.ndarray:
+        height, width = hsv.shape[:2]
+        features = []
+        for row in range(grid_size):
+            y1 = row * height // grid_size
+            y2 = (row + 1) * height // grid_size
+            for col in range(grid_size):
+                x1 = col * width // grid_size
+                x2 = (col + 1) * width // grid_size
+                cell = hsv[y1:y2, x1:x2]
+                hist = cv2.calcHist([cell], [0, 1], None, [8, 6], [0, 180, 0, 256])
+                hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
+                features.append(hist)
+        return _normalize_vector(np.concatenate(features))
+
+    def _lbp_histogram(self, gray: np.ndarray) -> np.ndarray:
+        center = gray[1:-1, 1:-1]
+        code = np.zeros(center.shape, dtype=np.uint8)
+        neighbors = [
+            gray[:-2, :-2],
+            gray[:-2, 1:-1],
+            gray[:-2, 2:],
+            gray[1:-1, 2:],
+            gray[2:, 2:],
+            gray[2:, 1:-1],
+            gray[2:, :-2],
+            gray[1:-1, :-2],
+        ]
+        for bit, neighbor in enumerate(neighbors):
+            code |= ((neighbor >= center).astype(np.uint8) << bit)
+        hist = np.bincount(code.ravel(), minlength=256).astype(np.float32)
+        total = float(np.sum(hist))
+        return hist / total if total > 0 else hist
+
+    def _gradient_histogram(self, gray: np.ndarray, grid_size: int = 4, bins: int = 8) -> np.ndarray:
+        gray_f = gray.astype(np.float32) / 255.0
+        grad_x = cv2.Sobel(gray_f, cv2.CV_32F, 1, 0, ksize=3)
+        grad_y = cv2.Sobel(gray_f, cv2.CV_32F, 0, 1, ksize=3)
+        magnitude, angle = cv2.cartToPolar(grad_x, grad_y, angleInDegrees=False)
+        bin_index = np.floor(angle * bins / (2.0 * math.pi)).astype(np.int32) % bins
+
+        height, width = gray.shape[:2]
+        features = []
+        for row in range(grid_size):
+            y1 = row * height // grid_size
+            y2 = (row + 1) * height // grid_size
+            for col in range(grid_size):
+                x1 = col * width // grid_size
+                x2 = (col + 1) * width // grid_size
+                cell_bins = bin_index[y1:y2, x1:x2].ravel()
+                cell_weights = magnitude[y1:y2, x1:x2].ravel()
+                hist = np.bincount(cell_bins, weights=cell_weights, minlength=bins).astype(np.float32)
+                features.append(hist)
+        return _normalize_vector(np.concatenate(features))
+
     def _face_descriptor(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[Dict[str, np.ndarray]]:
         clipped = _clip_box(bbox, frame.shape)
         if clipped is None:
@@ -558,14 +689,27 @@ class MuseTalkApiRuntime:
         hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
         hist = cv2.calcHist([hsv], [0, 1, 2], None, [12, 8, 4], [0, 180, 0, 256, 0, 256])
         hist = cv2.normalize(hist, hist).flatten().astype(np.float32)
+        spatial_hist = self._spatial_histogram(hsv)
 
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
         small = cv2.resize(gray, (32, 32), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
         small = small - float(np.mean(small))
-        dct = cv2.dct(small)[:8, :8].flatten()
+        dct = cv2.dct(small)[:12, :12].flatten()
+        lbp = self._lbp_histogram(gray)
+        grad = self._gradient_histogram(gray)
 
-        return {"hist": hist, "dct": _normalize_vector(dct)}
+        descriptor = {
+            "hist": hist,
+            "spatial_hist": spatial_hist,
+            "dct": _normalize_vector(dct),
+            "lbp": lbp,
+            "grad": grad,
+        }
+        embedding = self._face_embedding(crop)
+        if embedding is not None:
+            descriptor["embedding"] = embedding
+        return descriptor
 
     def _is_reasonable_face_box(
         self,
@@ -650,11 +794,31 @@ class MuseTalkApiRuntime:
         return False
 
     def _descriptor_similarity(self, left: Dict[str, np.ndarray], right: Dict[str, np.ndarray]) -> float:
+        if "embedding" in left and "embedding" in right:
+            embedding_score = float(np.dot(left["embedding"], right["embedding"]))
+            return float(np.clip((embedding_score + 1.0) / 2.0, 0.0, 1.0))
+
         hist_score = cv2.compareHist(left["hist"], right["hist"], cv2.HISTCMP_CORREL)
         hist_score = float(np.clip((hist_score + 1.0) / 2.0, 0.0, 1.0))
+        spatial_score = float(np.dot(left["spatial_hist"], right["spatial_hist"]))
+        spatial_score = float(np.clip((spatial_score + 1.0) / 2.0, 0.0, 1.0))
         dct_score = float(np.dot(left["dct"], right["dct"]))
         dct_score = float(np.clip((dct_score + 1.0) / 2.0, 0.0, 1.0))
-        return 0.45 * hist_score + 0.55 * dct_score
+        lbp_score = cv2.compareHist(
+            left["lbp"].astype(np.float32),
+            right["lbp"].astype(np.float32),
+            cv2.HISTCMP_CORREL,
+        )
+        lbp_score = float(np.clip((lbp_score + 1.0) / 2.0, 0.0, 1.0))
+        grad_score = float(np.dot(left["grad"], right["grad"]))
+        grad_score = float(np.clip((grad_score + 1.0) / 2.0, 0.0, 1.0))
+        return (
+            0.15 * hist_score
+            + 0.25 * spatial_score
+            + 0.25 * dct_score
+            + 0.15 * lbp_score
+            + 0.20 * grad_score
+        )
 
     def _avatar_descriptor(self, avatar_path: Path) -> Dict[str, np.ndarray]:
         avatar = cv2.imread(str(avatar_path))
@@ -663,6 +827,11 @@ class MuseTalkApiRuntime:
 
         boxes = self._detect_face_boxes(avatar)
         if not boxes:
+            if self.face_embedder is not None:
+                height, width = avatar.shape[:2]
+                descriptor = self._face_descriptor(avatar, (0, 0, width, height))
+                if descriptor is not None and "embedding" in descriptor:
+                    return descriptor
             raise RuntimeError("No face was detected in the avatar image.")
 
         descriptor = self._face_descriptor(avatar, boxes[0][0])
@@ -866,11 +1035,13 @@ class MuseTalkApiRuntime:
         avatar_descriptor: Dict[str, np.ndarray],
         threshold: float,
         bbox_shift: int,
+        identity_margin: float,
         min_detection_score: float = 0.0,
         require_landmark_match: bool = False,
         min_landmark_points: int = 8,
         min_landmark_overlap: float = 0.08,
         expected_descriptors: Optional[List[Dict[str, np.ndarray]]] = None,
+        negative_descriptors: Optional[List[Dict[str, np.ndarray]]] = None,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         face_boxes = self._detect_face_boxes(frame)
         if not face_boxes:
@@ -880,6 +1051,8 @@ class MuseTalkApiRuntime:
         best_bbox = None
         best_score = -1.0
         best_identity_score = -1.0
+        best_negative_score = 0.0
+        second_score = -1.0
         for bbox, detection_score in face_boxes:
             if not self._passes_face_filters(
                 frame,
@@ -901,13 +1074,26 @@ class MuseTalkApiRuntime:
                 if expected_descriptors
                 else avatar_score
             )
+            negative_score = (
+                max(self._descriptor_similarity(negative, descriptor) for negative in negative_descriptors)
+                if negative_descriptors
+                else 0.0
+            )
             score = 0.4 * avatar_score + 0.6 * identity_score
             if score > best_score:
+                second_score = best_score
                 best_score = score
                 best_identity_score = identity_score
+                best_negative_score = negative_score
                 best_bbox = bbox
+            elif score > second_score:
+                second_score = score
 
         if best_bbox is None or best_identity_score < threshold:
+            return None, max(0.0, best_score)
+        if best_negative_score > 0.0 and best_identity_score < best_negative_score + identity_margin:
+            return None, max(0.0, best_score)
+        if second_score >= 0.0 and best_score < second_score + identity_margin:
             return None, max(0.0, best_score)
 
         target_bbox = self._landmark_bbox_for_face(landmarks, best_bbox, bbox_shift, frame.shape)
@@ -970,6 +1156,23 @@ class MuseTalkApiRuntime:
         best_cluster = clusters[0]
         if float(best_cluster["avatar_score"]) < payload.similarity_threshold:
             return None
+
+        target_descriptors = list(best_cluster.get("descriptors") or [])
+        negative_descriptors = []
+        for cluster in clusters[1:]:
+            descriptors = cluster.get("descriptors") or []
+            target_score = max(
+                self._descriptor_similarity(target_descriptor, descriptor)
+                for target_descriptor in target_descriptors
+                for descriptor in descriptors
+            )
+            avatar_score = float(cluster["avatar_score"])
+            if avatar_score >= payload.similarity_threshold and target_score >= payload.similarity_threshold:
+                target_descriptors.extend(descriptors)
+            else:
+                negative_descriptors.extend(descriptors)
+        best_cluster["target_descriptors"] = target_descriptors
+        best_cluster["negative_descriptors"] = negative_descriptors
         return best_cluster
 
     def _bbox_with_margin(
@@ -1136,8 +1339,10 @@ class MuseTalkApiRuntime:
             frames, fps = _read_video_frames(paths["video"])
             avatar_descriptor = self._avatar_descriptor(paths["avatar"])
             target_identity = self._find_target_identity(frames, avatar_descriptor, payload)
-            target_descriptors = target_identity.get("descriptors") if target_identity else []
+            target_descriptors = target_identity.get("target_descriptors") if target_identity else []
+            negative_descriptors = target_identity.get("negative_descriptors") if target_identity else []
             target_identity_score = float(target_identity["avatar_score"]) if target_identity else 0.0
+            face_identity_backend = "embedding" if "embedding" in avatar_descriptor else "visual"
 
             targets = []
             matched_source_frames = 0
@@ -1149,11 +1354,13 @@ class MuseTalkApiRuntime:
                         avatar_descriptor,
                         payload.similarity_threshold,
                         payload.bbox_shift,
+                        payload.identity_margin,
                         min_detection_score=payload.min_detection_score,
                         require_landmark_match=payload.require_landmark_match,
                         min_landmark_points=payload.min_landmark_points,
                         min_landmark_overlap=payload.min_landmark_overlap,
                         expected_descriptors=target_descriptors,
+                        negative_descriptors=negative_descriptors,
                     )
                 else:
                     bbox, score = None, 0.0
@@ -1225,6 +1432,7 @@ class MuseTalkApiRuntime:
                 "skipped_output_frames": skipped_output_frames,
                 "best_similarity": max(best_scores) if best_scores else 0.0,
                 "target_identity_similarity": target_identity_score,
+                "face_identity_backend": face_identity_backend,
             }
 
 
@@ -1261,6 +1469,9 @@ def health() -> Dict[str, object]:
         "status": "ok",
         "detectors_loaded": runtime.detectors_loaded,
         "model_loaded": runtime.loaded,
+        "face_embedding_loaded": runtime.face_embedder is not None,
+        "face_embedding_backend": settings.face_embedding_backend,
+        "face_embedding_error": runtime.face_embedding_error,
         "port": settings.port,
     }
 
