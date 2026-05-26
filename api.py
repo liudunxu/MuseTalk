@@ -1939,6 +1939,8 @@ class MuseTalkApiRuntime:
                 "0:a:0",
                 "-c:v",
                 "copy",
+                "-af",
+                "apad",
                 "-c:a",
                 "aac",
                 "-shortest",
@@ -2062,13 +2064,16 @@ class MuseTalkApiRuntime:
                 audio_padding_length_left=payload.audio_padding_length_left,
                 audio_padding_length_right=payload.audio_padding_length_right,
             )
-            output_frame_count = len(whisper_chunks)
-            if output_frame_count == 0:
+            audio_frame_count = len(whisper_chunks)
+            if audio_frame_count == 0:
                 raise RuntimeError("Audio is too short to produce video frames.")
+            output_frame_count = len(frames)
 
             latents_by_frame = self._encode_latents(frames, targets, payload.extra_margin)
             process_items = []
             for output_index in range(output_frame_count):
+                if output_index >= audio_frame_count:
+                    continue
                 source_index = self._source_index_for_output(output_index, len(frames))
                 latent = latents_by_frame.get(source_index)
                 if latent is None:
@@ -2111,6 +2116,7 @@ class MuseTalkApiRuntime:
                 "output_path": output_path,
                 "source_frame_count": len(frames),
                 "output_frame_count": output_frame_count,
+                "audio_frame_count": audio_frame_count,
                 "matched_source_frames": matched_source_frames,
                 "filled_source_frames": filled_source_frames,
                 "smoothed_source_frames": smoothed_source_frames,
