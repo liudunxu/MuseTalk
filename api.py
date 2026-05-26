@@ -100,6 +100,33 @@ def _resolve_model_file(path_value: str, candidates: List[str]) -> str:
     return str(PROJECT_DIR / candidates[0])
 
 
+def _resolve_model_dir(path_value: str, candidates: List[str], required_files: List[str]) -> str:
+    candidate_dirs = []
+    if path_value:
+        path = Path(path_value)
+        candidate_dirs.append(path if path.is_absolute() else PROJECT_DIR / path_value)
+    candidate_dirs.extend(PROJECT_DIR / candidate for candidate in candidates)
+
+    for candidate_dir in candidate_dirs:
+        if all((candidate_dir / filename).is_file() for filename in required_files):
+            return str(candidate_dir)
+
+    fallback_dir = candidate_dirs[0]
+    missing = [filename for filename in required_files if not (fallback_dir / filename).is_file()]
+    if missing:
+        logger.warning("Model directory %s is missing required files: %s", fallback_dir, ", ".join(missing))
+    return str(fallback_dir)
+
+
+def _require_files(directory: str, required_files: List[str], label: str) -> None:
+    directory_path = Path(directory)
+    missing = [filename for filename in required_files if not (directory_path / filename).is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"{label} directory {directory_path} is missing required files: {', '.join(missing)}"
+        )
+
+
 settings.vae_type = _resolve_vae_type(settings.vae_type)
 settings.unet_config = _resolve_model_file(
     settings.unet_config,
@@ -108,6 +135,11 @@ settings.unet_config = _resolve_model_file(
 settings.unet_model_path = _resolve_model_file(
     settings.unet_model_path,
     ["models/musetalkV15/unet.pth", "models/musetalk/pytorch_model.bin"],
+)
+settings.whisper_dir = _resolve_model_dir(
+    settings.whisper_dir,
+    ["models/whisper"],
+    ["config.json", "pytorch_model.bin", "preprocessor_config.json"],
 )
 
 
@@ -393,6 +425,11 @@ class MuseTalkApiRuntime:
             self.unet.model = self.unet.model.to(self.device)
             self.weight_dtype = self.unet.model.dtype
 
+            _require_files(
+                settings.whisper_dir,
+                ["config.json", "pytorch_model.bin", "preprocessor_config.json"],
+                "Whisper",
+            )
             self.audio_processor = AudioProcessor(feature_extractor_path=settings.whisper_dir)
             self.whisper = WhisperModel.from_pretrained(settings.whisper_dir)
             self.whisper = self.whisper.to(device=self.device, dtype=self.weight_dtype).eval()
@@ -1236,7 +1273,11 @@ if __name__ == "__main__":
         args.unet_config,
         ["models/musetalkV15/musetalk.json", "models/musetalk/musetalk.json"],
     )
-    settings.whisper_dir = args.whisper_dir
+    settings.whisper_dir = _resolve_model_dir(
+        args.whisper_dir,
+        ["models/whisper"],
+        ["config.json", "pytorch_model.bin", "preprocessor_config.json"],
+    )
     settings.vae_type = _resolve_vae_type(args.vae_type)
 
     import uvicorn

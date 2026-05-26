@@ -72,4 +72,4 @@ These guidelines are working if diffs contain fewer unnecessary changes, impleme
 
 ## Repository Runtime Notes
 
-The API may be deployed from a server where the VAE weights directory is named `models/sd-vae-ft-mse` instead of `models/sd-vae`, and where MuseTalk weights are under `models/musetalk` without `models/musetalkV15`. Do not assume local model directory names; resolve or validate actual paths before loading models.
+The API may be deployed from a server where the VAE weights directory is named `models/sd-vae-ft-mse` instead of `models/sd-vae`, and where MuseTalk weights are under `models/musetalk` without `models/musetalkV15`. Do not assume local model directory names; resolve or validate actual paths before loading models. Whisper must include `config.json`, `pytorch_model.bin`, and `preprocessor_config.json` in `models/whisper`.
