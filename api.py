@@ -165,13 +165,15 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: str = Field(..., description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.68, ge=0.0, le=1.0)
-    identity_margin: float = Field(0.04, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.58, ge=0.0, le=1.0)
+    identity_margin: float = Field(0.0, ge=0.0, le=1.0)
     require_face_embedding: bool = True
+    allow_crop_embedding_fallback: bool = True
+    crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
-    min_detection_score: float = Field(0.7, ge=0.0, le=1.0)
+    min_detection_score: float = Field(0.5, ge=0.0, le=1.0)
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
@@ -767,13 +769,14 @@ class MuseTalkApiRuntime:
         frame: np.ndarray,
         bbox: Tuple[int, int, int, int],
         crop: np.ndarray,
+        allow_crop_embedding_fallback: bool,
     ) -> Optional[np.ndarray]:
         embedding_crop = self._crop_face(frame, bbox, 0.25)
         if embedding_crop is None:
             embedding_crop = crop
 
         embedding = self._face_embedding(embedding_crop)
-        if embedding is None:
+        if embedding is None and allow_crop_embedding_fallback:
             embedding = self._crop_face_embedding(embedding_crop)
         if embedding is None:
             embedding = self._face_embedding(frame, bbox)
@@ -784,6 +787,7 @@ class MuseTalkApiRuntime:
         frame: np.ndarray,
         bbox: Tuple[int, int, int, int],
         embedding_only: bool = False,
+        allow_crop_embedding_fallback: bool = True,
     ) -> Optional[Dict[str, np.ndarray]]:
         clipped = _clip_box(bbox, frame.shape)
         if clipped is None:
@@ -792,7 +796,12 @@ class MuseTalkApiRuntime:
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
             return None
-        embedding = self._descriptor_embedding(frame, clipped, crop)
+        embedding = self._descriptor_embedding(
+            frame,
+            clipped,
+            crop,
+            allow_crop_embedding_fallback,
+        )
         if embedding_only:
             return {"embedding": embedding} if embedding is not None else None
 
@@ -819,6 +828,10 @@ class MuseTalkApiRuntime:
         }
         if embedding is not None:
             descriptor["embedding"] = embedding
+        elif allow_crop_embedding_fallback:
+            embedding = self._crop_face_embedding(crop)
+            if embedding is not None:
+                descriptor["embedding"] = embedding
         return descriptor
 
     def _is_reasonable_face_box(
@@ -1221,6 +1234,8 @@ class MuseTalkApiRuntime:
         expected_descriptors: Optional[List[Dict[str, np.ndarray]]] = None,
         negative_descriptors: Optional[List[Dict[str, np.ndarray]]] = None,
         require_embedding: bool = False,
+        allow_crop_embedding_fallback: bool = True,
+        crop_embedding_min_detection_score: float = 0.0,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         face_boxes = self._detect_face_boxes(frame)
         if not face_boxes:
@@ -1247,6 +1262,10 @@ class MuseTalkApiRuntime:
                 frame,
                 bbox,
                 embedding_only=require_embedding,
+                allow_crop_embedding_fallback=(
+                    allow_crop_embedding_fallback
+                    and (not require_embedding or detection_score >= crop_embedding_min_detection_score)
+                ),
             )
             if descriptor is None:
                 continue
@@ -1336,6 +1355,10 @@ class MuseTalkApiRuntime:
                     frame,
                     bbox,
                     embedding_only=payload.require_face_embedding,
+                    allow_crop_embedding_fallback=(
+                        payload.allow_crop_embedding_fallback
+                        and detection_score >= payload.crop_embedding_min_detection_score
+                    ),
                 )
                 if descriptor is None:
                     continue
@@ -1598,6 +1621,8 @@ class MuseTalkApiRuntime:
                         expected_descriptors=target_descriptors,
                         negative_descriptors=negative_descriptors,
                         require_embedding=payload.require_face_embedding,
+                        allow_crop_embedding_fallback=payload.allow_crop_embedding_fallback,
+                        crop_embedding_min_detection_score=payload.crop_embedding_min_detection_score,
                     )
                 else:
                     bbox, score = None, 0.0
