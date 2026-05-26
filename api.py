@@ -69,7 +69,7 @@ class Settings:
     unet_model_path: str = os.getenv("MUSETALK_UNET_MODEL", "./models/musetalkV15/unet.pth")
     whisper_dir: str = os.getenv("MUSETALK_WHISPER_DIR", "./models/whisper")
     use_float16: bool = os.getenv("MUSETALK_USE_FLOAT16", "0").lower() in {"1", "true", "yes"}
-    face_confidence: float = float(os.getenv("MUSETALK_FACE_CONFIDENCE", "0.5"))
+    face_confidence: float = float(os.getenv("MUSETALK_FACE_CONFIDENCE", "0.35"))
     max_download_bytes: int = int(os.getenv("API_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
     download_retries: int = int(os.getenv("API_DOWNLOAD_RETRIES", "2"))
     download_retry_backoff_seconds: float = float(os.getenv("API_DOWNLOAD_RETRY_BACKOFF_SECONDS", "1.0"))
@@ -170,6 +170,7 @@ class LipSyncRequest(BaseModel):
     similarity_threshold: float = Field(0.52, ge=0.0, le=1.0)
     identity_margin: float = Field(0.05, ge=0.0, le=1.0)
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
+    default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
     require_face_embedding: bool = True
     allow_crop_embedding_fallback: bool = True
     crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
@@ -183,7 +184,7 @@ class LipSyncRequest(BaseModel):
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
-    min_detection_score: float = Field(0.5, ge=0.0, le=1.0)
+    min_detection_score: float = Field(0.35, ge=0.0, le=1.0)
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
@@ -1194,6 +1195,8 @@ class MuseTalkApiRuntime:
                     "best_bbox": bbox,
                     "best_frame_index": frame_index,
                     "best_detection_score": detection_score,
+                    "first_frame_index": frame_index,
+                    "first_area": area,
                     "count": 1,
                 }
             )
@@ -1512,7 +1515,24 @@ class MuseTalkApiRuntime:
                 reverse=True,
             )
             best_cluster = clusters[0]
+            most_frequent_coverage = int(best_cluster["count"]) / max(1, scanned_identity_frames)
+            if most_frequent_coverage < payload.default_identity_min_coverage:
+                clusters.sort(
+                    key=lambda item: (
+                        -int(item.get("first_frame_index", item["best_frame_index"])),
+                        int(item.get("first_area", item["max_area"])),
+                    ),
+                    reverse=True,
+                )
+                best_cluster = clusters[0]
+                selection_source = "first_largest_face"
+            else:
+                selection_source = "most_frequent_face"
+            identity_coverage = int(best_cluster["count"]) / max(1, scanned_identity_frames)
             best_cluster["avatar_score"] = 0.0
+            best_cluster["selection_source"] = selection_source
+            best_cluster["identity_coverage"] = identity_coverage
+            best_cluster["most_frequent_identity_coverage"] = most_frequent_coverage
             best_cluster["target_descriptors"] = list(best_cluster.get("descriptors") or [])
             negative_descriptors = []
             for cluster in clusters[1:]:
@@ -1960,6 +1980,7 @@ class MuseTalkApiRuntime:
                     "best_similarity": 0.0,
                     "target_identity_similarity": 0.0,
                     "target_identity_count": 0,
+                    "target_identity_coverage": 0.0,
                     "target_identity_source": "none",
                     "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
                 }
@@ -1971,8 +1992,13 @@ class MuseTalkApiRuntime:
                 else 0.0
             )
             target_identity_count = int(target_identity["count"]) if target_identity else 0
+            target_identity_coverage = float(target_identity.get("identity_coverage", 0.0)) if target_identity else 0.0
             face_identity_backend = "embedding" if payload.require_face_embedding else "visual"
-            target_identity_source = "avatar" if avatar_descriptor is not None else "most_frequent_face"
+            target_identity_source = (
+                "avatar"
+                if avatar_descriptor is not None
+                else str(target_identity.get("selection_source", "most_frequent_face")) if target_identity else "none"
+            )
 
             targets = []
             matched_source_frames = 0
@@ -2094,6 +2120,7 @@ class MuseTalkApiRuntime:
                 "best_similarity": max(best_scores) if best_scores else 0.0,
                 "target_identity_similarity": target_identity_score,
                 "target_identity_count": target_identity_count,
+                "target_identity_coverage": target_identity_coverage,
                 "target_identity_source": target_identity_source,
                 "face_identity_backend": face_identity_backend,
             }
