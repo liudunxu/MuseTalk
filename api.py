@@ -199,8 +199,11 @@ class LipSyncRequest(BaseModel):
     target_fill_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
     target_fill_max_center_shift: float = Field(0.8, ge=0.0, le=5.0)
     target_motion_gate_enabled: bool = True
-    target_motion_max_center_shift: float = Field(0.45, ge=0.0, le=5.0)
-    target_motion_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
+    target_motion_max_center_shift: float = Field(0.30, ge=0.0, le=5.0)
+    target_motion_max_scale_change: float = Field(0.25, ge=0.0, le=2.0)
+    target_fast_motion_gate_enabled: bool = True
+    target_fast_motion_max_center_shift_per_frame: float = Field(0.12, ge=0.0, le=2.0)
+    target_fast_motion_max_scale_change_per_frame: float = Field(0.08, ge=0.0, le=2.0)
     target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
     target_bbox_smoothing_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
@@ -1768,6 +1771,49 @@ class MuseTalkApiRuntime:
                 filtered += 1
         return filtered
 
+    def _filter_fast_motion_targets(
+        self,
+        targets: List[Dict[str, object]],
+        enabled: bool,
+        max_center_shift_per_frame: float,
+        max_scale_change_per_frame: float,
+    ) -> int:
+        if not enabled or not targets:
+            return 0
+
+        valid_indices = [index for index, target in enumerate(targets) if target.get("bbox") is not None]
+        if len(valid_indices) < 2:
+            return 0
+
+        filtered_indices = set()
+        previous_index = valid_indices[0]
+        previous_bbox = targets[previous_index].get("bbox")
+        for index in valid_indices[1:]:
+            current_bbox = targets[index].get("bbox")
+            if previous_bbox is None or current_bbox is None:
+                previous_index = index
+                previous_bbox = current_bbox
+                continue
+
+            frame_gap = max(1, index - previous_index)
+            center_shift = self._bbox_center_shift(previous_bbox, current_bbox) / frame_gap
+            scale_change = self._bbox_scale_change(previous_bbox, current_bbox) / frame_gap
+            if (
+                (max_center_shift_per_frame > 0.0 and center_shift > max_center_shift_per_frame)
+                or (max_scale_change_per_frame > 0.0 and scale_change > max_scale_change_per_frame)
+            ):
+                filtered_indices.add(index)
+            previous_index = index
+            previous_bbox = current_bbox
+
+        for index in filtered_indices:
+            targets[index] = {
+                **targets[index],
+                "bbox": None,
+                "filtered_reason": "fast_motion",
+            }
+        return len(filtered_indices)
+
     def _filter_lipsync_targets(
         self,
         targets: List[Dict[str, object]],
@@ -2317,6 +2363,7 @@ class MuseTalkApiRuntime:
                     "matched_source_frames": 0,
                     "filled_source_frames": 0,
                     "filtered_motion_frames": 0,
+                    "filtered_fast_motion_frames": 0,
                     "filtered_small_face_frames": 0,
                     "filtered_short_segment_frames": 0,
                     "smoothed_source_frames": 0,
@@ -2394,6 +2441,12 @@ class MuseTalkApiRuntime:
                 payload.target_motion_gate_enabled,
                 payload.target_motion_max_center_shift,
                 payload.target_motion_max_scale_change,
+            )
+            filtered_fast_motion_frames = self._filter_fast_motion_targets(
+                targets,
+                payload.target_fast_motion_gate_enabled,
+                payload.target_fast_motion_max_center_shift_per_frame,
+                payload.target_fast_motion_max_scale_change_per_frame,
             )
             filtered_small_face_frames, filtered_short_segment_frames = self._filter_lipsync_targets(
                 targets,
@@ -2497,6 +2550,7 @@ class MuseTalkApiRuntime:
                 "matched_source_frames": matched_source_frames,
                 "filled_source_frames": filled_source_frames,
                 "filtered_motion_frames": filtered_motion_frames,
+                "filtered_fast_motion_frames": filtered_fast_motion_frames,
                 "filtered_small_face_frames": filtered_small_face_frames,
                 "filtered_short_segment_frames": filtered_short_segment_frames,
                 "smoothed_source_frames": smoothed_source_frames,
