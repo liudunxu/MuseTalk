@@ -207,7 +207,7 @@ class LipSyncRequest(BaseModel):
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
-    lipsync_min_segment_frames: int = Field(8, ge=1, le=300)
+    lipsync_min_segment_frames: int = Field(5, ge=1, le=300)
     lipsync_min_face_area_ratio: float = Field(0.008, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(18, ge=0, le=100)
