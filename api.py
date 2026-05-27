@@ -221,6 +221,13 @@ class LipSyncRequest(BaseModel):
     batch_size: int = Field(8, ge=1, le=64)
     audio_padding_length_left: int = Field(2, ge=0, le=10)
     audio_padding_length_right: int = Field(2, ge=0, le=10)
+    speech_gate_enabled: bool = True
+    speech_gate_relative_db: float = Field(-42.0, ge=-80.0, le=0.0)
+    speech_gate_min_rms: float = Field(0.00035, ge=0.0, le=1.0)
+    speech_gate_window_seconds: float = Field(0.12, ge=0.02, le=0.5)
+    speech_gate_pre_roll_seconds: float = Field(0.04, ge=0.0, le=1.0)
+    speech_gate_post_roll_seconds: float = Field(0.12, ge=0.0, le=1.0)
+    speech_gate_fill_gap_seconds: float = Field(0.16, ge=0.0, le=1.0)
 
 
 class FaceListRequest(BaseModel):
@@ -1837,6 +1844,146 @@ class MuseTalkApiRuntime:
             return cycle_index
         return cycle_length - cycle_index - 1
 
+    @staticmethod
+    def _fill_activity_gaps(mask: np.ndarray, max_gap_frames: int) -> np.ndarray:
+        if max_gap_frames <= 0 or not mask.any():
+            return mask
+
+        filled = mask.copy()
+        index = 0
+        while index < len(filled):
+            if filled[index]:
+                index += 1
+                continue
+
+            gap_start = index
+            while index < len(filled) and not filled[index]:
+                index += 1
+            gap_end = index
+            if gap_start == 0 or gap_end >= len(filled):
+                continue
+            if gap_end - gap_start <= max_gap_frames:
+                filled[gap_start:gap_end] = True
+        return filled
+
+    @staticmethod
+    def _pad_activity_mask(mask: np.ndarray, pre_roll_frames: int, post_roll_frames: int) -> np.ndarray:
+        if (pre_roll_frames <= 0 and post_roll_frames <= 0) or not mask.any():
+            return mask
+
+        padded = mask.copy()
+        index = 0
+        while index < len(mask):
+            if not mask[index]:
+                index += 1
+                continue
+
+            segment_start = index
+            while index < len(mask) and mask[index]:
+                index += 1
+            segment_end = index
+            padded[
+                max(0, segment_start - pre_roll_frames):min(len(mask), segment_end + post_roll_frames)
+            ] = True
+        return padded
+
+    def _audio_activity_mask(
+        self,
+        audio_path: Path,
+        fps: float,
+        frame_count: int,
+        enabled: bool,
+        relative_db: float,
+        min_rms: float,
+        window_seconds: float,
+        pre_roll_seconds: float,
+        post_roll_seconds: float,
+        fill_gap_seconds: float,
+    ) -> Tuple[List[bool], Dict[str, object]]:
+        if frame_count <= 0:
+            return [], {"enabled": enabled, "active_frames": 0, "silent_frames": 0}
+        if not enabled:
+            return [True] * frame_count, {
+                "enabled": False,
+                "active_frames": frame_count,
+                "silent_frames": 0,
+            }
+        fps = float(fps)
+        if fps <= 0:
+            raise ValueError(f"fps must be positive, got {fps}")
+
+        try:
+            import librosa
+
+            audio, sample_rate = librosa.load(str(audio_path), sr=16000, mono=True)
+        except Exception as exc:
+            logger.warning("Could not compute speech gate for %s: %s", audio_path, exc, exc_info=True)
+            return [True] * frame_count, {
+                "enabled": False,
+                "error": str(exc),
+                "active_frames": frame_count,
+                "silent_frames": 0,
+            }
+
+        if audio.size == 0:
+            return [False] * frame_count, {
+                "enabled": True,
+                "active_frames": 0,
+                "silent_frames": frame_count,
+                "threshold_rms": 0.0,
+                "peak_rms": 0.0,
+                "noise_floor_rms": 0.0,
+            }
+
+        audio = audio.astype(np.float32, copy=False)
+        half_window = max(1, int(round(window_seconds * sample_rate / 2.0)))
+        rms_values = []
+        for frame_index in range(frame_count):
+            center = int(round((frame_index + 0.5) * sample_rate / fps))
+            start = max(0, center - half_window)
+            end = min(len(audio), center + half_window)
+            if end <= start:
+                rms_values.append(0.0)
+                continue
+            samples = audio[start:end]
+            rms_values.append(float(np.sqrt(np.mean(np.square(samples)))))
+
+        rms = np.asarray(rms_values, dtype=np.float32)
+        nonzero_rms = rms[rms > 1e-8]
+        if nonzero_rms.size == 0:
+            return [False] * frame_count, {
+                "enabled": True,
+                "active_frames": 0,
+                "silent_frames": frame_count,
+                "threshold_rms": 0.0,
+                "peak_rms": 0.0,
+                "noise_floor_rms": 0.0,
+            }
+
+        peak_rms = float(np.percentile(nonzero_rms, 95))
+        noise_floor = float(np.percentile(nonzero_rms, 20))
+        relative_threshold = peak_rms * (10.0 ** (relative_db / 20.0))
+        noise_spread = peak_rms / max(noise_floor, 1e-8)
+        noise_threshold = noise_floor * 2.0 if noise_spread > 5.0 else noise_floor * 0.5
+        threshold = max(float(min_rms), relative_threshold, noise_threshold)
+
+        mask = rms >= threshold
+        fill_gap_frames = int(round(fill_gap_seconds * fps))
+        pre_roll_frames = int(round(pre_roll_seconds * fps))
+        post_roll_frames = int(round(post_roll_seconds * fps))
+        mask = self._fill_activity_gaps(mask, fill_gap_frames)
+        mask = self._pad_activity_mask(mask, pre_roll_frames, post_roll_frames)
+
+        active_frames = int(mask.sum())
+        return mask.tolist(), {
+            "enabled": True,
+            "active_frames": active_frames,
+            "silent_frames": frame_count - active_frames,
+            "threshold_rms": threshold,
+            "peak_rms": peak_rms,
+            "noise_floor_rms": noise_floor,
+        }
+
     def _run_inference_batches(
         self,
         process_items: List[Tuple[int, torch.Tensor, torch.Tensor]],
@@ -2151,11 +2298,25 @@ class MuseTalkApiRuntime:
             if audio_frame_count == 0:
                 raise RuntimeError("Audio is too short to produce video frames.")
             output_frame_count = len(frames)
+            speech_activity_mask, speech_gate_stats = self._audio_activity_mask(
+                paths["audio"],
+                fps,
+                output_frame_count,
+                payload.speech_gate_enabled,
+                payload.speech_gate_relative_db,
+                payload.speech_gate_min_rms,
+                payload.speech_gate_window_seconds,
+                payload.speech_gate_pre_roll_seconds,
+                payload.speech_gate_post_roll_seconds,
+                payload.speech_gate_fill_gap_seconds,
+            )
 
             latents_by_frame = self._encode_latents(frames, targets, payload.extra_margin)
             process_items = []
             for output_index in range(output_frame_count):
                 if output_index >= audio_frame_count:
+                    continue
+                if speech_activity_mask and not speech_activity_mask[output_index]:
                     continue
                 source_index = self._source_index_for_output(output_index, len(frames))
                 latent = latents_by_frame.get(source_index)
@@ -2215,6 +2376,7 @@ class MuseTalkApiRuntime:
                 "target_identity_coverage": target_identity_coverage,
                 "target_identity_source": target_identity_source,
                 "face_identity_backend": face_identity_backend,
+                "speech_gate": speech_gate_stats,
             }
 
 
