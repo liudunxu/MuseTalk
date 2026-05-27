@@ -80,10 +80,14 @@ When working on `/api/lipsync`:
 
 - Prefer InsightFace embeddings for identity decisions. The avatar image may be omitted; in that case select the most frequently observed face identity from the input video.
 - If a frame has no matching target face, keep the original frame. Do not raise `No Face Detected` for intermittent misses.
+- Keep identity matching and speech activity as separate gates: target face matching answers "which person may be edited"; audio activity answers "whether this frame should be driven by lipsync." A frame should be generated only when both gates pass.
+- For "speaking moves, silence stays still" behavior, use the audio speech gate before building inference batches. Silent or weak-audio frames should pass through unchanged even if the target face is visible.
 - Avoid fixing identity misses by only lowering thresholds. Use short-gap filling and temporal continuity so brief embedding failures do not create audio-mouth discontinuities.
 - Keep target matching conservative around other people: fill only short gaps bounded by confirmed target frames, and use position continuity limits to reduce wrong-person edits.
 - For lip/audio alignment, preserve fractional video fps. Common rates such as `29.97` and `23.976` must not be truncated to integers when slicing Whisper audio features.
 - For visual quality, small bbox smoothing and light color matching before blending are safer first-line improvements than large crop/mask changes.
+- Keep output frame count and duration tied to the source video. If audio is shorter, late frames should remain original; if audio is longer, extra audio chunks should not extend the video.
+- The current image-sequence renderer must write every output frame for ffmpeg, but MuseTalk inference and heavy blending should only run for frames that actually need modification.
 
 When working on `/api/faces`, sort distinct identities by observed count first, then by face area as a tie-breaker. The face crops produced by this API should remain compatible with `/api/lipsync` avatar detection.
 
@@ -127,7 +131,9 @@ Important `/api/lipsync` behavior:
 - With `avatar_url`, only the matching identity should be modified.
 - Without `avatar_url`, the default target is the identity with the highest observed count in the video.
 - Frames without a matching target must pass through unchanged.
+- Frames where the target face is visible but the driving audio is silent or below the speech gate should pass through unchanged.
 - Short target gaps may be filled when bounded by confirmed target frames; long gaps or large position jumps should remain unchanged.
+- API responses should expose enough counters to debug quality, including matched frames, filled frames, eligible frames, generated frames, skipped frames, target identity source, and speech gate statistics.
 
 ## Maintenance Checklist
 
@@ -135,6 +141,7 @@ When changing API behavior:
 
 - Keep `/api/faces` crops compatible with `/api/lipsync` avatar detection.
 - Preserve structured error responses with both `detail` and traceback logging for server debugging.
+- Preserve "pass through unchanged" semantics for no-face, no-target, too-small-face, short-segment, and silent-audio cases.
 - Run at least `python -m py_compile api.py` after API edits; include changed utility files in the same command.
 - Run `git diff --check` before committing.
 - Do not commit generated media, downloaded inputs, model weights, or cache files.
