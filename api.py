@@ -204,6 +204,9 @@ class LipSyncRequest(BaseModel):
     target_fast_motion_gate_enabled: bool = True
     target_fast_motion_max_center_shift_per_frame: float = Field(0.12, ge=0.0, le=2.0)
     target_fast_motion_max_scale_change_per_frame: float = Field(0.08, ge=0.0, le=2.0)
+    target_fast_motion_min_run_frames: int = Field(5, ge=1, le=120)
+    lipsync_continuity_max_gap_seconds: float = Field(0.35, ge=0.0, le=2.0)
+    lipsync_continuity_max_center_shift: float = Field(1.2, ge=0.0, le=5.0)
     target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
     target_bbox_smoothing_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
@@ -1777,6 +1780,7 @@ class MuseTalkApiRuntime:
         enabled: bool,
         max_center_shift_per_frame: float,
         max_scale_change_per_frame: float,
+        min_run_frames: int,
     ) -> int:
         if not enabled or not targets:
             return 0
@@ -1785,7 +1789,7 @@ class MuseTalkApiRuntime:
         if len(valid_indices) < 2:
             return 0
 
-        filtered_indices = set()
+        candidate_indices = set()
         previous_index = valid_indices[0]
         previous_bbox = targets[previous_index].get("bbox")
         for index in valid_indices[1:]:
@@ -1802,9 +1806,22 @@ class MuseTalkApiRuntime:
                 (max_center_shift_per_frame > 0.0 and center_shift > max_center_shift_per_frame)
                 or (max_scale_change_per_frame > 0.0 and scale_change > max_scale_change_per_frame)
             ):
-                filtered_indices.add(index)
+                candidate_indices.add(index)
             previous_index = index
             previous_bbox = current_bbox
+
+        filtered_indices = set()
+        candidate_runs = []
+        for index in sorted(candidate_indices):
+            if not candidate_runs or index != candidate_runs[-1][-1] + 1:
+                candidate_runs.append([index])
+            else:
+                candidate_runs[-1].append(index)
+
+        min_run_frames = max(1, int(min_run_frames))
+        for run in candidate_runs:
+            if len(run) >= min_run_frames:
+                filtered_indices.update(run)
 
         for index in filtered_indices:
             targets[index] = {
@@ -2364,6 +2381,7 @@ class MuseTalkApiRuntime:
                     "filled_source_frames": 0,
                     "filtered_motion_frames": 0,
                     "filtered_fast_motion_frames": 0,
+                    "continuity_filled_source_frames": 0,
                     "filtered_small_face_frames": 0,
                     "filtered_short_segment_frames": 0,
                     "smoothed_source_frames": 0,
@@ -2447,6 +2465,16 @@ class MuseTalkApiRuntime:
                 payload.target_fast_motion_gate_enabled,
                 payload.target_fast_motion_max_center_shift_per_frame,
                 payload.target_fast_motion_max_scale_change_per_frame,
+                payload.target_fast_motion_min_run_frames,
+            )
+            continuity_filled_source_frames = self._fill_short_target_gaps(
+                targets,
+                fps,
+                frames[0].shape if frames else (0, 0, 3),
+                payload.lipsync_continuity_max_gap_seconds,
+                payload.target_fill_window_seconds,
+                payload.target_fill_min_match_ratio,
+                payload.lipsync_continuity_max_center_shift,
             )
             filtered_small_face_frames, filtered_short_segment_frames = self._filter_lipsync_targets(
                 targets,
@@ -2551,10 +2579,13 @@ class MuseTalkApiRuntime:
                 "filled_source_frames": filled_source_frames,
                 "filtered_motion_frames": filtered_motion_frames,
                 "filtered_fast_motion_frames": filtered_fast_motion_frames,
+                "continuity_filled_source_frames": continuity_filled_source_frames,
                 "filtered_small_face_frames": filtered_small_face_frames,
                 "filtered_short_segment_frames": filtered_short_segment_frames,
                 "smoothed_source_frames": smoothed_source_frames,
-                "matched_or_filled_source_frames": matched_source_frames + filled_source_frames,
+                "matched_or_filled_source_frames": (
+                    matched_source_frames + filled_source_frames + continuity_filled_source_frames
+                ),
                 "eligible_source_frames": eligible_source_frames,
                 "generated_output_frames": len(generated),
                 "quality_fallback_frames": quality_fallback_frames,
