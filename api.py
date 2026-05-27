@@ -197,9 +197,12 @@ class LipSyncRequest(BaseModel):
     target_fill_max_gap_seconds: float = Field(0.6, ge=0.0, le=3.0)
     target_fill_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
     target_fill_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
-    target_fill_max_center_shift: float = Field(1.5, ge=0.0, le=5.0)
-    target_bbox_smoothing_window: int = Field(5, ge=1, le=15)
-    target_bbox_smoothing_max_center_shift: float = Field(0.75, ge=0.0, le=5.0)
+    target_fill_max_center_shift: float = Field(0.8, ge=0.0, le=5.0)
+    target_motion_gate_enabled: bool = True
+    target_motion_max_center_shift: float = Field(0.45, ge=0.0, le=5.0)
+    target_motion_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
+    target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
+    target_bbox_smoothing_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
@@ -1628,6 +1631,15 @@ class MuseTalkApiRuntime:
         right_scale = math.sqrt(max(1, _box_area(right)))
         return distance / max(1.0, (left_scale + right_scale) / 2.0)
 
+    def _bbox_scale_change(
+        self,
+        left: Tuple[int, int, int, int],
+        right: Tuple[int, int, int, int],
+    ) -> float:
+        left_scale = math.sqrt(max(1, _box_area(left)))
+        right_scale = math.sqrt(max(1, _box_area(right)))
+        return abs(left_scale - right_scale) / max(1.0, (left_scale + right_scale) / 2.0)
+
     def _interpolate_bbox(
         self,
         left: Tuple[int, int, int, int],
@@ -1706,6 +1718,55 @@ class MuseTalkApiRuntime:
                 }
                 filled += 1
         return filled
+
+    def _filter_motion_targets(
+        self,
+        targets: List[Dict[str, object]],
+        frame_shape: Tuple[int, int, int],
+        enabled: bool,
+        max_center_shift: float,
+        max_scale_change: float,
+    ) -> int:
+        if not enabled or not targets:
+            return 0
+
+        valid_indices = [index for index, target in enumerate(targets) if target.get("bbox") is not None]
+        if len(valid_indices) < 3:
+            return 0
+
+        filtered = 0
+        for valid_position, index in enumerate(valid_indices):
+            if valid_position == 0 or valid_position == len(valid_indices) - 1:
+                continue
+
+            previous_index = valid_indices[valid_position - 1]
+            next_index = valid_indices[valid_position + 1]
+            previous_bbox = targets[previous_index].get("bbox")
+            next_bbox = targets[next_index].get("bbox")
+            current_bbox = targets[index].get("bbox")
+            if previous_bbox is None or next_bbox is None or current_bbox is None:
+                continue
+
+            ratio = (index - previous_index) / max(1, next_index - previous_index)
+            expected_bbox = self._interpolate_bbox(previous_bbox, next_bbox, ratio, frame_shape)
+            if expected_bbox is None:
+                continue
+
+            center_shift = self._bbox_center_shift(expected_bbox, current_bbox)
+            scale_change = self._bbox_scale_change(expected_bbox, current_bbox)
+            if (
+                (max_center_shift > 0.0 and center_shift > max_center_shift)
+                or (max_scale_change > 0.0 and scale_change > max_scale_change)
+            ):
+                targets[index] = {
+                    **targets[index],
+                    "bbox": None,
+                    "filtered_reason": "motion_outlier",
+                    "motion_center_shift": center_shift,
+                    "motion_scale_change": scale_change,
+                }
+                filtered += 1
+        return filtered
 
     def _filter_lipsync_targets(
         self,
@@ -2255,6 +2316,7 @@ class MuseTalkApiRuntime:
                     "output_frame_count": len(frames),
                     "matched_source_frames": 0,
                     "filled_source_frames": 0,
+                    "filtered_motion_frames": 0,
                     "filtered_small_face_frames": 0,
                     "filtered_short_segment_frames": 0,
                     "smoothed_source_frames": 0,
@@ -2325,6 +2387,13 @@ class MuseTalkApiRuntime:
                 payload.target_fill_window_seconds,
                 payload.target_fill_min_match_ratio,
                 payload.target_fill_max_center_shift,
+            )
+            filtered_motion_frames = self._filter_motion_targets(
+                targets,
+                frames[0].shape if frames else (0, 0, 3),
+                payload.target_motion_gate_enabled,
+                payload.target_motion_max_center_shift,
+                payload.target_motion_max_scale_change,
             )
             filtered_small_face_frames, filtered_short_segment_frames = self._filter_lipsync_targets(
                 targets,
@@ -2427,6 +2496,7 @@ class MuseTalkApiRuntime:
                 "audio_frame_count": audio_frame_count,
                 "matched_source_frames": matched_source_frames,
                 "filled_source_frames": filled_source_frames,
+                "filtered_motion_frames": filtered_motion_frames,
                 "filtered_small_face_frames": filtered_small_face_frames,
                 "filtered_short_segment_frames": filtered_short_segment_frames,
                 "smoothed_source_frames": smoothed_source_frames,
