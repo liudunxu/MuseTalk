@@ -222,10 +222,10 @@ class LipSyncRequest(BaseModel):
     extra_margin: int = Field(10, ge=0, le=100)
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
-    blend_mask_blur_ratio: float = Field(0.03, ge=0.0, le=0.2)
-    color_match_strength: float = Field(0.35, ge=0.0, le=1.0)
-    mouth_detail_strength: float = Field(0.30, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.50, ge=0.0, le=1.0)
+    blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
+    color_match_strength: float = Field(0.45, ge=0.0, le=1.0)
+    mouth_detail_strength: float = Field(0.55, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.75, ge=0.0, le=1.0)
     quality_gate_enabled: bool = True
     quality_min_laplacian: float = Field(15.0, ge=0.0, le=2000.0)
     quality_min_sharpness_ratio: float = Field(0.20, ge=0.0, le=1.0)
