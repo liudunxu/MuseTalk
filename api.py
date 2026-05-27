@@ -213,9 +213,13 @@ class LipSyncRequest(BaseModel):
     extra_margin: int = Field(18, ge=0, le=100)
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
-    blend_mask_blur_ratio: float = Field(0.06, ge=0.0, le=0.2)
+    blend_mask_blur_ratio: float = Field(0.045, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.35, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.25, ge=0.0, le=1.0)
+    mouth_detail_strength: float = Field(0.18, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.32, ge=0.0, le=1.0)
+    quality_gate_enabled: bool = True
+    quality_min_laplacian: float = Field(2.0, ge=0.0, le=2000.0)
+    quality_min_sharpness_ratio: float = Field(0.08, ge=0.0, le=1.0)
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -2040,6 +2044,46 @@ class MuseTalkApiRuntime:
         sharpened = cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
         return np.clip(sharpened, 0, 255).astype(np.uint8)
 
+    def _restore_reference_detail(
+        self,
+        image: np.ndarray,
+        reference: np.ndarray,
+        strength: float,
+    ) -> np.ndarray:
+        if strength <= 0.0 or image.size == 0 or reference.size == 0:
+            return image
+        if image.shape != reference.shape:
+            return image
+
+        reference_float = reference.astype(np.float32)
+        reference_blur = cv2.GaussianBlur(reference_float, (0, 0), 1.0)
+        detail = reference_float - reference_blur
+        restored = image.astype(np.float32) + detail * strength
+        return np.clip(restored, 0, 255).astype(np.uint8)
+
+    def _laplacian_variance(self, image: np.ndarray) -> float:
+        if image.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    def _is_low_quality_generation(
+        self,
+        image: np.ndarray,
+        reference: np.ndarray,
+        min_laplacian: float,
+        min_sharpness_ratio: float,
+    ) -> bool:
+        image_sharpness = self._laplacian_variance(image)
+        if image_sharpness >= min_laplacian:
+            return False
+
+        reference_sharpness = self._laplacian_variance(reference)
+        if reference_sharpness <= 1e-6:
+            return False
+
+        return image_sharpness / reference_sharpness < min_sharpness_ratio
+
     def _write_result_frames(
         self,
         frames: List[np.ndarray],
@@ -2052,11 +2096,16 @@ class MuseTalkApiRuntime:
         blend_upper_boundary_ratio: float,
         blend_mask_blur_ratio: float,
         color_match_strength: float,
+        mouth_detail_strength: float,
         mouth_sharpen_strength: float,
+        quality_gate_enabled: bool,
+        quality_min_laplacian: float,
+        quality_min_sharpness_ratio: float,
         face_parser: Optional[FaceParsing],
-    ) -> None:
+    ) -> int:
         output_dir.mkdir(parents=True, exist_ok=True)
         frame_count = len(frames)
+        quality_fallback_frames = 0
         blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
         for output_index in _progress(
             range(output_frame_count),
@@ -2105,7 +2154,17 @@ class MuseTalkApiRuntime:
                 )
                 reference_crop = original_frame[y1:y2, x1:x2]
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
+                resized = self._restore_reference_detail(resized, reference_crop, mouth_detail_strength)
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
+                if quality_gate_enabled and self._is_low_quality_generation(
+                    resized,
+                    reference_crop,
+                    quality_min_laplacian,
+                    quality_min_sharpness_ratio,
+                ):
+                    quality_fallback_frames += 1
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
                 mask_array, crop_box = material
                 combined = get_image_blending(
                     original_frame,
@@ -2117,6 +2176,7 @@ class MuseTalkApiRuntime:
             except Exception:
                 combined = original_frame
             cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), combined)
+        return quality_fallback_frames
 
     def _frames_to_video(self, frames_dir: Path, fps: float, temp_video_path: Path) -> None:
         subprocess.run(
@@ -2332,7 +2392,7 @@ class MuseTalkApiRuntime:
                 else None
             )
             render_dir = job_output_dir / "frames"
-            self._write_result_frames(
+            quality_fallback_frames = self._write_result_frames(
                 frames,
                 targets,
                 generated,
@@ -2343,7 +2403,11 @@ class MuseTalkApiRuntime:
                 payload.blend_upper_boundary_ratio,
                 payload.blend_mask_blur_ratio,
                 payload.color_match_strength,
+                payload.mouth_detail_strength,
                 payload.mouth_sharpen_strength,
+                payload.quality_gate_enabled,
+                payload.quality_min_laplacian,
+                payload.quality_min_sharpness_ratio,
                 face_parser,
             )
 
@@ -2369,6 +2433,8 @@ class MuseTalkApiRuntime:
                 "matched_or_filled_source_frames": matched_source_frames + filled_source_frames,
                 "eligible_source_frames": eligible_source_frames,
                 "generated_output_frames": len(generated),
+                "quality_fallback_frames": quality_fallback_frames,
+                "effective_generated_output_frames": max(0, len(generated) - quality_fallback_frames),
                 "skipped_output_frames": skipped_output_frames,
                 "best_similarity": max(best_scores) if best_scores else 0.0,
                 "target_identity_similarity": target_identity_score,
