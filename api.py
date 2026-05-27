@@ -234,6 +234,7 @@ class LipSyncRequest(BaseModel):
     batch_size: int = Field(8, ge=1, le=64)
     audio_padding_length_left: int = Field(2, ge=0, le=10)
     audio_padding_length_right: int = Field(2, ge=0, le=10)
+    audio_sync_offset_seconds: float = Field(0.04, ge=-0.5, le=0.5)
     speech_gate_enabled: bool = True
     speech_gate_relative_db: float = Field(-42.0, ge=-80.0, le=0.0)
     speech_gate_min_rms: float = Field(0.00035, ge=0.0, le=1.0)
@@ -2326,7 +2327,14 @@ class MuseTalkApiRuntime:
             check=True,
         )
 
-    def _combine_audio(self, audio_path: Path, temp_video_path: Path, output_path: Path) -> None:
+    def _combine_audio(
+        self,
+        audio_path: Path,
+        temp_video_path: Path,
+        output_path: Path,
+        video_duration_seconds: float,
+    ) -> None:
+        duration = max(0.001, float(video_duration_seconds))
         subprocess.run(
             [
                 "ffmpeg",
@@ -2334,20 +2342,23 @@ class MuseTalkApiRuntime:
                 "-v",
                 "warning",
                 "-i",
-                str(audio_path),
-                "-i",
                 str(temp_video_path),
+                "-i",
+                str(audio_path),
                 "-map",
-                "1:v:0",
+                "0:v:0",
                 "-map",
-                "0:a:0",
+                "1:a:0",
                 "-c:v",
                 "copy",
                 "-af",
-                "apad",
+                f"apad,atrim=0:{duration:.6f}",
+                "-ar",
+                "44100",
                 "-c:a",
                 "aac",
-                "-shortest",
+                "-t",
+                f"{duration:.6f}",
                 str(output_path),
             ],
             check=True,
@@ -2508,6 +2519,7 @@ class MuseTalkApiRuntime:
             if audio_frame_count == 0:
                 raise RuntimeError("Audio is too short to produce video frames.")
             output_frame_count = len(frames)
+            audio_sync_offset_frames = int(round(payload.audio_sync_offset_seconds * fps))
             speech_activity_mask, speech_gate_stats = self._audio_activity_mask(
                 paths["audio"],
                 fps,
@@ -2523,16 +2535,19 @@ class MuseTalkApiRuntime:
 
             latents_by_frame = self._encode_latents(frames, targets, payload.extra_margin)
             process_items = []
+            max_audio_index = min(audio_frame_count - 1, output_frame_count - 1)
             for output_index in range(output_frame_count):
                 if output_index >= audio_frame_count:
                     continue
-                if speech_activity_mask and not speech_activity_mask[output_index]:
+                audio_index = min(max(output_index + audio_sync_offset_frames, 0), max_audio_index)
+                speech_index = min(max(output_index + audio_sync_offset_frames, 0), len(speech_activity_mask) - 1)
+                if speech_activity_mask and not speech_activity_mask[speech_index]:
                     continue
                 source_index = self._source_index_for_output(output_index, len(frames))
                 latent = latents_by_frame.get(source_index)
                 if latent is None:
                     continue
-                process_items.append((output_index, whisper_chunks[output_index], latent))
+                process_items.append((output_index, whisper_chunks[audio_index], latent))
 
             generated = self._run_inference_batches(process_items, payload.batch_size) if process_items else {}
 
@@ -2564,7 +2579,7 @@ class MuseTalkApiRuntime:
             temp_video_path = job_output_dir / "temp_video.mp4"
             output_path = job_output_dir / "result.mp4"
             self._frames_to_video(render_dir, fps, temp_video_path)
-            self._combine_audio(paths["audio"], temp_video_path, output_path)
+            self._combine_audio(paths["audio"], temp_video_path, output_path, output_frame_count / fps)
 
             shutil.rmtree(render_dir, ignore_errors=True)
             temp_video_path.unlink(missing_ok=True)
@@ -2575,6 +2590,8 @@ class MuseTalkApiRuntime:
                 "source_frame_count": len(frames),
                 "output_frame_count": output_frame_count,
                 "audio_frame_count": audio_frame_count,
+                "audio_sync_offset_frames": audio_sync_offset_frames,
+                "audio_sync_offset_seconds": payload.audio_sync_offset_seconds,
                 "matched_source_frames": matched_source_frames,
                 "filled_source_frames": filled_source_frames,
                 "filtered_motion_frames": filtered_motion_frames,
