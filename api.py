@@ -69,7 +69,7 @@ class Settings:
     unet_model_path: str = os.getenv("MUSETALK_UNET_MODEL", "./models/musetalkV15/unet.pth")
     whisper_dir: str = os.getenv("MUSETALK_WHISPER_DIR", "./models/whisper")
     use_float16: bool = os.getenv("MUSETALK_USE_FLOAT16", "0").lower() in {"1", "true", "yes"}
-    face_confidence: float = float(os.getenv("MUSETALK_FACE_CONFIDENCE", "0.35"))
+    face_confidence: float = float(os.getenv("MUSETALK_FACE_CONFIDENCE", "0.30"))
     max_download_bytes: int = int(os.getenv("API_MAX_DOWNLOAD_BYTES", str(2 * 1024 * 1024 * 1024)))
     download_retries: int = int(os.getenv("API_DOWNLOAD_RETRIES", "2"))
     download_retry_backoff_seconds: float = float(os.getenv("API_DOWNLOAD_RETRY_BACKOFF_SECONDS", "1.0"))
@@ -120,6 +120,29 @@ def _resolve_model_file(path_value: str, candidates: List[str]) -> str:
     return str(PROJECT_DIR / candidates[0])
 
 
+def _resolve_musetalk_model_paths(unet_config: str, unet_model_path: str) -> Tuple[str, str]:
+    model_layouts = [
+        ("models/musetalkV15/musetalk.json", "models/musetalkV15/unet.pth"),
+        ("models/musetalk/musetalk.json", "models/musetalk/pytorch_model.bin"),
+    ]
+    for config_candidate, model_candidate in model_layouts:
+        config_path = PROJECT_DIR / config_candidate
+        model_path = PROJECT_DIR / model_candidate
+        if config_path.is_file() and model_path.is_file():
+            return str(config_path), str(model_path)
+
+    return (
+        _resolve_model_file(
+            unet_config,
+            ["models/musetalkV15/musetalk.json", "models/musetalk/musetalk.json"],
+        ),
+        _resolve_model_file(
+            unet_model_path,
+            ["models/musetalkV15/unet.pth", "models/musetalk/pytorch_model.bin"],
+        ),
+    )
+
+
 def _resolve_model_dir(path_value: str, candidates: List[str], required_files: List[str]) -> str:
     candidate_dirs = []
     if path_value:
@@ -148,13 +171,9 @@ def _require_files(directory: str, required_files: List[str], label: str) -> Non
 
 
 settings.vae_type = _resolve_vae_type(settings.vae_type)
-settings.unet_config = _resolve_model_file(
+settings.unet_config, settings.unet_model_path = _resolve_musetalk_model_paths(
     settings.unet_config,
-    ["models/musetalkV15/musetalk.json", "models/musetalk/musetalk.json"],
-)
-settings.unet_model_path = _resolve_model_file(
     settings.unet_model_path,
-    ["models/musetalkV15/unet.pth", "models/musetalk/pytorch_model.bin"],
 )
 settings.whisper_dir = _resolve_model_dir(
     settings.whisper_dir,
@@ -167,7 +186,7 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.52, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.50, ge=0.0, le=1.0)
     identity_margin: float = Field(0.05, ge=0.0, le=1.0)
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
@@ -184,10 +203,12 @@ class LipSyncRequest(BaseModel):
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
-    min_detection_score: float = Field(0.35, ge=0.0, le=1.0)
+    min_detection_score: float = Field(0.30, ge=0.0, le=1.0)
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
+    lipsync_min_segment_frames: int = Field(8, ge=1, le=300)
+    lipsync_min_face_area_ratio: float = Field(0.008, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(18, ge=0, le=100)
     parsing_mode: str = "jaw"
@@ -1675,6 +1696,58 @@ class MuseTalkApiRuntime:
                 filled += 1
         return filled
 
+    def _filter_lipsync_targets(
+        self,
+        targets: List[Dict[str, object]],
+        frame_shape: Tuple[int, int, int],
+        min_segment_frames: int,
+        min_face_area_ratio: float,
+    ) -> Tuple[int, int]:
+        if not targets:
+            return 0, 0
+
+        frame_area = max(1, int(frame_shape[0]) * int(frame_shape[1]))
+        valid_targets = [False] * len(targets)
+        small_face_frames = 0
+        for index, target in enumerate(targets):
+            bbox = target.get("bbox")
+            if bbox is None:
+                continue
+            face_area_ratio = _box_area(bbox) / frame_area
+            if face_area_ratio < min_face_area_ratio:
+                targets[index] = {
+                    **target,
+                    "bbox": None,
+                    "face_area_ratio": face_area_ratio,
+                    "filtered_reason": "face_too_small",
+                }
+                small_face_frames += 1
+                continue
+            targets[index]["face_area_ratio"] = face_area_ratio
+            valid_targets[index] = True
+
+        short_segment_frames = 0
+        index = 0
+        min_segment_frames = max(1, int(min_segment_frames))
+        while index < len(targets):
+            if not valid_targets[index]:
+                index += 1
+                continue
+            segment_start = index
+            while index < len(targets) and valid_targets[index]:
+                index += 1
+            segment_end = index
+            if segment_end - segment_start >= min_segment_frames:
+                continue
+            for filtered_index in range(segment_start, segment_end):
+                targets[filtered_index] = {
+                    **targets[filtered_index],
+                    "bbox": None,
+                    "filtered_reason": "short_target_segment",
+                }
+                short_segment_frames += 1
+        return small_face_frames, short_segment_frames
+
     def _smooth_target_bboxes(
         self,
         targets: List[Dict[str, object]],
@@ -1975,8 +2048,11 @@ class MuseTalkApiRuntime:
                     "output_frame_count": len(frames),
                     "matched_source_frames": 0,
                     "filled_source_frames": 0,
+                    "filtered_small_face_frames": 0,
+                    "filtered_short_segment_frames": 0,
                     "smoothed_source_frames": 0,
                     "matched_or_filled_source_frames": 0,
+                    "eligible_source_frames": 0,
                     "generated_output_frames": 0,
                     "skipped_output_frames": len(frames),
                     "best_similarity": 0.0,
@@ -2043,12 +2119,19 @@ class MuseTalkApiRuntime:
                 payload.target_fill_min_match_ratio,
                 payload.target_fill_max_center_shift,
             )
+            filtered_small_face_frames, filtered_short_segment_frames = self._filter_lipsync_targets(
+                targets,
+                frames[0].shape if frames else (0, 0, 3),
+                payload.lipsync_min_segment_frames,
+                payload.lipsync_min_face_area_ratio,
+            )
             smoothed_source_frames = self._smooth_target_bboxes(
                 targets,
                 frames[0].shape if frames else (0, 0, 3),
                 payload.target_bbox_smoothing_window,
                 payload.target_bbox_smoothing_max_center_shift,
             )
+            eligible_source_frames = sum(1 for target in targets if target.get("bbox") is not None)
 
             self.load()
             whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(str(paths["audio"]))
@@ -2119,8 +2202,11 @@ class MuseTalkApiRuntime:
                 "audio_frame_count": audio_frame_count,
                 "matched_source_frames": matched_source_frames,
                 "filled_source_frames": filled_source_frames,
+                "filtered_small_face_frames": filtered_small_face_frames,
+                "filtered_short_segment_frames": filtered_short_segment_frames,
                 "smoothed_source_frames": smoothed_source_frames,
                 "matched_or_filled_source_frames": matched_source_frames + filled_source_frames,
+                "eligible_source_frames": eligible_source_frames,
                 "generated_output_frames": len(generated),
                 "skipped_output_frames": skipped_output_frames,
                 "best_similarity": max(best_scores) if best_scores else 0.0,
@@ -2313,13 +2399,9 @@ if __name__ == "__main__":
     settings.ffmpeg_path = args.ffmpeg_path
     settings.gpu_id = args.gpu_id
     settings.use_float16 = args.use_float16
-    settings.unet_model_path = _resolve_model_file(
-        args.unet_model_path,
-        ["models/musetalkV15/unet.pth", "models/musetalk/pytorch_model.bin"],
-    )
-    settings.unet_config = _resolve_model_file(
+    settings.unet_config, settings.unet_model_path = _resolve_musetalk_model_paths(
         args.unet_config,
-        ["models/musetalkV15/musetalk.json", "models/musetalk/musetalk.json"],
+        args.unet_model_path,
     )
     settings.whisper_dir = _resolve_model_dir(
         args.whisper_dir,
