@@ -234,7 +234,19 @@ class LipSyncRequest(BaseModel):
     batch_size: int = Field(8, ge=1, le=64)
     audio_padding_length_left: int = Field(2, ge=0, le=10)
     audio_padding_length_right: int = Field(2, ge=0, le=10)
-    audio_sync_offset_seconds: float = Field(0.04, ge=-0.5, le=0.5)
+    audio_sync_offset_seconds: float = Field(0.0, ge=-0.5, le=0.5)
+    audio_feature_fps: float = Field(
+        0.0,
+        ge=0.0,
+        le=120.0,
+        description="0 follows source fps, otherwise use this fps for Whisper audio features",
+    )
+    max_audio_feature_fps: float = Field(
+        25.0,
+        ge=0.0,
+        le=120.0,
+        description="0 disables capping; high-fps videos default to 25fps audio features",
+    )
     speech_gate_enabled: bool = True
     speech_gate_relative_db: float = Field(-42.0, ge=-80.0, le=0.0)
     speech_gate_min_rms: float = Field(0.00035, ge=0.0, le=1.0)
@@ -1974,6 +1986,35 @@ class MuseTalkApiRuntime:
         return cycle_length - cycle_index - 1
 
     @staticmethod
+    def _resolve_audio_feature_fps(source_fps: float, payload: LipSyncRequest) -> float:
+        source_fps = float(source_fps or 25.0)
+        if source_fps <= 0.0:
+            source_fps = 25.0
+        requested_fps = float(payload.audio_feature_fps or 0.0)
+        if requested_fps > 0.0:
+            return requested_fps
+        max_feature_fps = float(payload.max_audio_feature_fps or 0.0)
+        if max_feature_fps > 0.0:
+            return min(source_fps, max_feature_fps)
+        return source_fps
+
+    @staticmethod
+    def _audio_feature_index_for_output(
+        output_index: int,
+        source_fps: float,
+        audio_feature_fps: float,
+        audio_frame_count: int,
+        offset_frames: int,
+    ) -> int:
+        if audio_frame_count <= 1:
+            return 0
+        source_fps = max(1e-6, float(source_fps))
+        audio_feature_fps = max(1e-6, float(audio_feature_fps))
+        time_seconds = (float(output_index) + 0.5) / source_fps
+        audio_index = int(round(time_seconds * audio_feature_fps - 0.5)) + int(offset_frames)
+        return min(max(audio_index, 0), audio_frame_count - 1)
+
+    @staticmethod
     def _fill_activity_gaps(mask: np.ndarray, max_gap_frames: int) -> np.ndarray:
         if max_gap_frames <= 0 or not mask.any():
             return mask
@@ -2505,13 +2546,14 @@ class MuseTalkApiRuntime:
             whisper_input_features, librosa_length = self.audio_processor.get_audio_feature(str(paths["audio"]))
             if whisper_input_features is None:
                 raise RuntimeError(f"Could not read audio: {paths['audio']}")
+            audio_feature_fps = self._resolve_audio_feature_fps(fps, payload)
             whisper_chunks = self.audio_processor.get_whisper_chunk(
                 whisper_input_features,
                 self.device,
                 self.weight_dtype,
                 self.whisper,
                 librosa_length,
-                fps=fps,
+                fps=audio_feature_fps,
                 audio_padding_length_left=payload.audio_padding_length_left,
                 audio_padding_length_right=payload.audio_padding_length_right,
             )
@@ -2519,7 +2561,8 @@ class MuseTalkApiRuntime:
             if audio_frame_count == 0:
                 raise RuntimeError("Audio is too short to produce video frames.")
             output_frame_count = len(frames)
-            audio_sync_offset_frames = int(round(payload.audio_sync_offset_seconds * fps))
+            audio_sync_offset_frames = int(round(payload.audio_sync_offset_seconds * audio_feature_fps))
+            speech_sync_offset_frames = int(round(payload.audio_sync_offset_seconds * fps))
             speech_activity_mask, speech_gate_stats = self._audio_activity_mask(
                 paths["audio"],
                 fps,
@@ -2535,12 +2578,15 @@ class MuseTalkApiRuntime:
 
             latents_by_frame = self._encode_latents(frames, targets, payload.extra_margin)
             process_items = []
-            max_audio_index = min(audio_frame_count - 1, output_frame_count - 1)
             for output_index in range(output_frame_count):
-                if output_index >= audio_frame_count:
-                    continue
-                audio_index = min(max(output_index + audio_sync_offset_frames, 0), max_audio_index)
-                speech_index = min(max(output_index + audio_sync_offset_frames, 0), len(speech_activity_mask) - 1)
+                audio_index = self._audio_feature_index_for_output(
+                    output_index,
+                    fps,
+                    audio_feature_fps,
+                    audio_frame_count,
+                    audio_sync_offset_frames,
+                )
+                speech_index = min(max(output_index + speech_sync_offset_frames, 0), len(speech_activity_mask) - 1)
                 if speech_activity_mask and not speech_activity_mask[speech_index]:
                     continue
                 source_index = self._source_index_for_output(output_index, len(frames))
@@ -2590,7 +2636,10 @@ class MuseTalkApiRuntime:
                 "source_frame_count": len(frames),
                 "output_frame_count": output_frame_count,
                 "audio_frame_count": audio_frame_count,
+                "source_fps": round(float(fps), 6),
+                "audio_feature_fps": round(float(audio_feature_fps), 6),
                 "audio_sync_offset_frames": audio_sync_offset_frames,
+                "audio_sync_offset_output_frames": speech_sync_offset_frames,
                 "audio_sync_offset_seconds": payload.audio_sync_offset_seconds,
                 "matched_source_frames": matched_source_frames,
                 "filled_source_frames": filled_source_frames,
