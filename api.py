@@ -370,10 +370,13 @@ class LipSyncRequest(BaseModel):
         description="Run CodeFormer face restoration on the aligned face crops before paste-back.",
     )
     codeformer_fidelity_weight: float = Field(
-        0.5,
+        0.7,
         ge=0.0,
         le=1.0,
-        description="CodeFormer fidelity weight. 0 = sharpest, 1 = closest to input. 0.5 is the upstream default.",
+        description="CodeFormer fidelity weight. 0 = sharpest (most codebook-driven, identity drift), "
+                    "1 = closest to input. Default 0.7 is tuned for lip-sync output: the upstream "
+                    "0.5 over-reconstructs the inpainter's output and tends to overwrite the "
+                    "lipsync with a 'more typical' face. 0.85+ is safest for identity preservation.",
     )
     codeformer_adain: bool = Field(
         True,
@@ -2026,6 +2029,86 @@ class MuseTalkApiRuntime:
             }
         return len(filtered_indices)
 
+    @staticmethod
+    def _mouth_region_diff(prev_crop: np.ndarray, curr_crop: np.ndarray) -> float:
+        """Mean absolute diff in the mouth band of two face crops.
+
+        Both inputs are BGR uint8 numpy arrays. Returns the diff
+        normalized to [0, 1]. The mouth band is the region y 55-74%,
+        x 30-70% of the crop (same ROI as LatentSync's check).
+
+        Returns 0.0 on None / empty / shape mismatch (defensive).
+        """
+        if prev_crop is None or curr_crop is None:
+            return 0.0
+        if prev_crop.size == 0 or curr_crop.size == 0:
+            return 0.0
+        if prev_crop.shape != curr_crop.shape:
+            return 0.0
+        try:
+            h, w = prev_crop.shape[:2]
+            y0, y1 = int(h * 0.55), int(h * 0.74)
+            x0, x1 = int(w * 0.30), int(w * 0.70)
+            if y1 <= y0 or x1 <= x0:
+                return 0.0
+            prev_mouth = prev_crop[y0:y1, x0:x1].astype(np.float32)
+            curr_mouth = curr_crop[y0:y1, x0:x1].astype(np.float32)
+            return float(np.mean(np.abs(curr_mouth - prev_mouth))) / 255.0
+        except Exception:
+            return 0.0
+
+    def _filter_mouth_diff_targets(
+        self,
+        targets: List[Dict[str, object]],
+        frames: List[np.ndarray],
+        threshold: float,
+    ) -> int:
+        """Filter target frames where the mouth-region pixel diff
+        between consecutive face crops exceeds the threshold.
+
+        Catches face switches the embedding-similarity check misses
+        (similar-looking people, side faces). Complementary to
+        identity matching: embedding asks "same person?", pixel diff
+        asks "same content?".
+        """
+        if threshold <= 0.0 or not targets or not frames:
+            return 0
+
+        valid_indices = [i for i, t in enumerate(targets) if t.get("bbox") is not None]
+        if len(valid_indices) < 2:
+            return 0
+
+        filtered = 0
+        prev_crop = None
+        prev_index = -1
+        for index in valid_indices:
+            bbox = targets[index].get("bbox")
+            if bbox is None or index >= len(frames):
+                continue
+            x1, y1, x2, y2 = bbox
+            frame = frames[index]
+            crop = frame[max(0, y1):min(frame.shape[0], y2), max(0, x1):min(frame.shape[1], x2)]
+            if crop.size == 0:
+                prev_crop = None
+                prev_index = index
+                continue
+            if prev_crop is not None and (index - prev_index) <= 3:
+                diff = self._mouth_region_diff(prev_crop, crop)
+                if diff > threshold:
+                    targets[index] = {
+                        **targets[index],
+                        "bbox": None,
+                        "filtered_reason": "mouth_diff_break",
+                        "mouth_region_diff": diff,
+                    }
+                    filtered += 1
+                    prev_crop = None
+                    prev_index = index
+                    continue
+            prev_crop = crop
+            prev_index = index
+        return filtered
+
     def _filter_lipsync_targets(
         self,
         targets: List[Dict[str, object]],
@@ -2718,6 +2801,7 @@ class MuseTalkApiRuntime:
                     "filled_source_frames": 0,
                     "filtered_motion_frames": 0,
                     "filtered_fast_motion_frames": 0,
+                    "filtered_mouth_diff_frames": 0,
                     "continuity_filled_source_frames": 0,
                     "filtered_small_face_frames": 0,
                     "filtered_short_segment_frames": 0,
@@ -2861,6 +2945,11 @@ class MuseTalkApiRuntime:
                 payload.target_fast_motion_max_center_shift_per_frame,
                 payload.target_fast_motion_max_scale_change_per_frame,
                 payload.target_fast_motion_min_run_frames,
+            )
+            filtered_mouth_diff_frames = self._filter_mouth_diff_targets(
+                targets,
+                frames,
+                payload.lipsync_mouth_diff_break_threshold,
             )
             continuity_filled_source_frames = self._fill_short_target_gaps(
                 targets,
@@ -3076,6 +3165,7 @@ class MuseTalkApiRuntime:
                 "filled_source_frames": filled_source_frames,
                 "filtered_motion_frames": filtered_motion_frames,
                 "filtered_fast_motion_frames": filtered_fast_motion_frames,
+                "filtered_mouth_diff_frames": filtered_mouth_diff_frames,
                 "continuity_filled_source_frames": continuity_filled_source_frames,
                 "filtered_small_face_frames": filtered_small_face_frames,
                 "filtered_short_segment_frames": filtered_short_segment_frames,

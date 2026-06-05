@@ -166,7 +166,7 @@ class CodeFormerRestorer:
         self,
         faces: torch.Tensor,
         skip_mask: Optional[Sequence[bool]] = None,
-        fidelity_weight: float = 0.5,
+        fidelity_weight: float = 0.7,
         adain: Optional[bool] = None,
     ) -> tuple:
         """Restore a sequence of aligned face crops.
