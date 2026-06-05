@@ -81,6 +81,14 @@ class Settings:
     )
     face_embedding_det_size: int = int(os.getenv("MUSETALK_FACE_EMBEDDING_DET_SIZE", "640"))
     progress_enabled: bool = os.getenv("API_PROGRESS", "1").lower() not in {"0", "false", "no", "off"}
+    # CodeFormer face-restoration postprocess (accepted for LatentSync
+    # client compatibility). MuseTalk is encoder-decoder and has no
+    # CodeFormer integration; these env vars are surfaced in the
+    # ``/health`` response and the lipsync response ``codeformer`` block.
+    codeformer_checkpoint_path: str = os.getenv("MUSETALK_CODEFORMER_CKPT", "")
+    codeformer_preload: bool = os.getenv("MUSETALK_CODEFORMER_PRELOAD", "0").lower() in {"1", "true", "yes"}
+    codeformer_batch_size: int = int(os.getenv("MUSETALK_CODEFORMER_BATCH_SIZE", "8"))
+    codeformer_required: bool = os.getenv("MUSETALK_CODEFORMER_REQUIRED", "0").lower() in {"1", "true", "yes"}
 
 
 settings = Settings()
@@ -183,10 +191,13 @@ settings.whisper_dir = _resolve_model_dir(
 
 
 class LipSyncRequest(BaseModel):
+    # Field order is kept identical to LatentSync api.py:94-285 for
+    # cross-repository client compatibility (the frontend at
+    # ~/Downloads/dub can switch backends without re-validating).
     video_url: str = Field(..., description="Source video URL")
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.55, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.5, ge=0.0, le=1.0)
     identity_margin: float = Field(0.05, ge=0.0, le=1.0)
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
@@ -206,7 +217,21 @@ class LipSyncRequest(BaseModel):
     target_fast_motion_max_scale_change_per_frame: float = Field(0.08, ge=0.0, le=2.0)
     target_fast_motion_min_run_frames: int = Field(5, ge=1, le=120)
     lipsync_continuity_max_gap_seconds: float = Field(0.35, ge=0.0, le=2.0)
-    lipsync_continuity_max_center_shift: float = Field(1.2, ge=0.0, le=5.0)
+    lipsync_continuity_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
+    lipsync_continuity_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
+    # Mouth-region pixel diff break: complementary to the embedding
+    # similarity check. When the mouth region mean abs diff between
+    # consecutive aligned face crops exceeds this fraction, treat the
+    # next frame as a continuity break -- catches face switches the
+    # embedding check misses (similar-looking people, side faces).
+    # 0 disables. Default 0.10 is above same-person expression/pose
+    # diff (~0.02-0.05) and below cross-person diff (~0.10-0.30).
+    # MuseTalk accepts the field for API compatibility; the diff
+    # break itself is not currently enforced at runtime.
+    lipsync_mouth_diff_break_threshold: float = Field(
+        0.10, ge=0.0, le=1.0,
+        description="Mouth-region mean abs diff break threshold; 0 disables.",
+    )
     target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
     target_bbox_smoothing_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
@@ -225,10 +250,88 @@ class LipSyncRequest(BaseModel):
     blend_mask_blur_ratio: float = Field(0.01, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.35, ge=0.0, le=1.0)
-    quality_gate_enabled: bool = True
-    quality_min_laplacian: float = Field(15.0, ge=0.0, le=2000.0)
-    quality_min_sharpness_ratio: float = Field(0.20, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
+    mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
+    mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
+    mouth_audio_adaptive_motion_enabled: bool = True
+    mouth_audio_motion_min_scale: float = Field(0.65, ge=0.0, le=2.0)
+    mouth_audio_motion_max_scale: float = Field(1.15, ge=0.0, le=2.0)
+    # Inpaint mask override. None = use the server-side default.
+    # MuseTalk does not consume this field (encoder-decoder pipeline,
+    # not diffusion inpainting); it is accepted for API compatibility
+    # with LatentSync and logged when non-default.
+    mask_image_path: Optional[str] = Field(
+        None,
+        description="Override the inpaint mask path. None = use server default.",
+    )
+    # Quality gate. Disabled by default (matching LatentSync's
+    # conservative posture -- a difficult frame falls back to the
+    # source, never returns smeared lips).
+    quality_gate_enabled: bool = False
+    quality_min_laplacian: float = Field(0.04, ge=0.0, le=2000.0)
+    quality_min_sharpness_ratio: float = Field(0.05, ge=0.0, le=1.0)
+    quality_ref_min_laplacian: float = Field(
+        1.00,
+        ge=0.0,
+        le=2000.0,
+        description="Only apply generated/reference sharpness-ratio fallback when the source mouth ROI is at least this sharp.",
+    )
+    quality_max_fallback_ratio: float = Field(
+        0.80,
+        ge=0.0,
+        le=1.0,
+        description="Disable quality fallback for this run if it would skip more than this fraction of non-prefiltered frames.",
+    )
+    # Side-face / fast-turn prefilters (diffusion-only). MuseTalk does
+    # not currently implement yaw-based skipping; values are accepted
+    # for API compatibility and logged when non-default.
+    yaw_skip_threshold: float = Field(45.0, ge=0.0, le=90.0)
+    yaw_rate_skip_threshold: float = Field(28.0, ge=0.0, le=45.0)
+    side_face_episode_pre_pad: int = Field(0, ge=0, le=30)
+    side_face_episode_post_pad: int = Field(0, ge=0, le=30)
+    yaw_warn_threshold_ratio: float = Field(0.75, ge=0.0, le=1.0)
+    side_face_warn_min_run_frames: int = Field(
+        0,
+        ge=0,
+        le=120,
+        description="Skip sustained near-profile runs above the yaw warn threshold; 0 disables.",
+    )
+    # Per-request inference overrides. None = use server-side setting
+    # (LatentSync uses these for a 质量预设 group fast/balanced/quality).
+    # MuseTalk is single-step, so guidance/inference_steps/deepcache
+    # have no effect; values are accepted for schema compatibility and
+    # logged when non-default. seed affects torch/numpy RNG for the
+    # inference path when set.
+    guidance_scale_override: Optional[float] = Field(
+        None, ge=0.0, le=10.0, description="Classifier-free guidance scale. None = use server default. (Diffusion-only; no effect in MuseTalk.)"
+    )
+    inference_steps_override: Optional[int] = Field(
+        None, ge=1, le=100, description="DDIM inference steps. None = use server default. (Diffusion-only; no effect in MuseTalk.)"
+    )
+    seed_override: Optional[int] = Field(
+        None, description="RNG seed (-1 for random). None = use server default."
+    )
+    enable_deepcache_override: Optional[bool] = Field(
+        None, description="Hint for DeepCache enable. None = use server default. (Diffusion-only; no effect in MuseTalk.)"
+    )
+    # Mouth-occlusion prefilter. MuseTalk does not currently implement
+    # an occlusion detector; value is accepted for schema compatibility.
+    mouth_occlusion_skip_threshold: float = Field(1.0, ge=0.0, le=1.0)
+    # Motion-blur input filter. Not currently implemented in MuseTalk;
+    # value is accepted for schema compatibility.
+    motion_blur_skip_threshold: float = Field(0.08, ge=0.0, le=10.0)
+    face_jump_center_threshold: float = Field(
+        0.0,
+        ge=0.0,
+        le=2.0,
+        description="Skip frames whose landmark center jumps by more than this fraction of face size; 0 disables.",
+    )
+    face_jump_scale_threshold: float = Field(
+        0.0,
+        ge=0.0,
+        le=2.0,
+        description="Skip frames whose landmark face scale changes abruptly by more than this fraction; 0 disables.",
+    )
     left_cheek_width: int = Field(75, ge=1, le=240)
     right_cheek_width: int = Field(75, ge=1, le=240)
     batch_size: int = Field(8, ge=1, le=64)
@@ -247,24 +350,50 @@ class LipSyncRequest(BaseModel):
         le=120.0,
         description="0 disables capping; high-fps videos default to 25fps audio features",
     )
-    speech_gate_enabled: bool = True
+    # Speech gate is intentionally disabled by default to mirror
+    # LatentSync's conservative posture -- the per-frame RMS gate can
+    # mask out soft speech on noisy audio. The MuseTalk impl remains
+    # available; clients that want it can opt in.
+    speech_gate_enabled: bool = False
     speech_gate_relative_db: float = Field(-42.0, ge=-80.0, le=0.0)
     speech_gate_min_rms: float = Field(0.00035, ge=0.0, le=1.0)
     speech_gate_window_seconds: float = Field(0.12, ge=0.02, le=0.5)
     speech_gate_pre_roll_seconds: float = Field(0.04, ge=0.0, le=1.0)
     speech_gate_post_roll_seconds: float = Field(0.12, ge=0.0, le=1.0)
     speech_gate_fill_gap_seconds: float = Field(0.16, ge=0.0, le=1.0)
+    # --- CodeFormer face-restoration postprocess (added for LatentSync parity) ---
+    # MuseTalk is an encoder-decoder model, not a diffusion inpainter, so
+    # the CodeFormer postprocess is not available. The fields below are
+    # accepted on the wire for cross-backend client compatibility; the
+    # response always reports ``codeformer.unsupported=True``.
+    codeformer_enabled: bool = Field(
+        False,
+        description="Run CodeFormer face restoration on the aligned face crops before paste-back. (Diffusion-only; not available in MuseTalk.)",
+    )
+    codeformer_fidelity_weight: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="CodeFormer fidelity weight. 0 = sharpest, 1 = closest to input. 0.5 is the upstream default.",
+    )
+    codeformer_required: bool = Field(
+        settings.codeformer_required,
+        description="If True and codeformer_enabled=True, fail the request when the CodeFormer checkpoint is missing.",
+    )
 
 
 class FaceListRequest(BaseModel):
+    # Defaults mirror LatentSync api.py:288-299 (favor recall -- lower
+    # thresholds and a per-frame scan so we surface as many distinct
+    # faces as possible for the user to pick from).
     video_url: str = Field(..., description="Source video URL")
     similarity_threshold: float = Field(0.78, ge=0.0, le=1.0)
-    frame_sample_interval: int = Field(0, ge=0, le=300, description="0 means sample about 2 frames per second")
+    frame_sample_interval: int = Field(1, ge=0, le=300, description="0 means sample about 2 frames per second; 1 scans every frame")
     max_frames: int = Field(0, ge=0, description="0 means scan all sampled frames")
-    min_face_area: int = Field(400, ge=1)
-    min_detection_score: float = Field(0.8, ge=0.0, le=1.0)
-    require_face_embedding: bool = True
-    require_landmark_match: bool = True
+    min_face_area: int = Field(100, ge=1)
+    min_detection_score: float = Field(0.35, ge=0.0, le=1.0)
+    require_face_embedding: bool = False
+    require_landmark_match: bool = False
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     crop_padding: float = Field(0.8, ge=0.0, le=1.5)
@@ -2405,10 +2534,106 @@ class MuseTalkApiRuntime:
             check=True,
         )
 
+    @staticmethod
+    def _log_unsupported_fields(payload: LipSyncRequest) -> None:
+        """Warn about LipSyncRequest fields that are accepted for
+        cross-backend API compatibility but do not affect MuseTalk's
+        encoder-decoder pipeline. We log at INFO rather than WARNING
+        because the field defaults are common; a real warning is
+        reserved for non-default opt-ins.
+        """
+        # Diffusion-only inference overrides. None means "use server
+        # default", which is the only mode MuseTalk knows about.
+        diffusion_overrides = (
+            ("guidance_scale_override", payload.guidance_scale_override),
+            ("inference_steps_override", payload.inference_steps_override),
+            ("enable_deepcache_override", payload.enable_deepcache_override),
+        )
+        for name, value in diffusion_overrides:
+            if value is not None:
+                logger.info(
+                    "[LipSync] %s=%s is a LatentSync diffusion-only field; "
+                    "MuseTalk is encoder-decoder single-step, this hint is ignored.",
+                    name, value,
+                )
+        if payload.mask_image_path is not None:
+            logger.info(
+                "[LipSync] mask_image_path=%s is a LatentSync diffusion-only field; "
+                "MuseTalk uses the in-house blending mask and ignores this override.",
+                payload.mask_image_path,
+            )
+
+        # Pre-filter thresholds. The defaults below are the
+        # "filter disabled" values (matching LatentSync's recent
+        # relaxations), so we only log when the caller explicitly
+        # tightened them.
+        prefilter_thresholds = (
+            ("mouth_occlusion_skip_threshold", payload.mouth_occlusion_skip_threshold, 1.0),
+            ("motion_blur_skip_threshold", payload.motion_blur_skip_threshold, 0.08),
+            ("face_jump_center_threshold", payload.face_jump_center_threshold, 0.0),
+            ("face_jump_scale_threshold", payload.face_jump_scale_threshold, 0.0),
+        )
+        for name, value, disabled_value in prefilter_thresholds:
+            if value != disabled_value:
+                logger.info(
+                    "[LipSync] %s=%s is a LatentSync prefilter knob; "
+                    "MuseTalk does not currently implement %s-based skipping, "
+                    "the value is accepted but ignored.",
+                    name, value, name.split("_")[0],
+                )
+        if (
+            payload.yaw_skip_threshold != 45.0
+            or payload.yaw_rate_skip_threshold != 28.0
+            or payload.side_face_episode_pre_pad != 0
+            or payload.side_face_episode_post_pad != 0
+            or payload.yaw_warn_threshold_ratio != 0.75
+            or payload.side_face_warn_min_run_frames != 0
+        ):
+            logger.info(
+                "[LipSync] yaw-based side-face filters (yaw_skip=%s, yaw_rate=%s, "
+                "pre_pad=%s, post_pad=%s, warn_ratio=%s, warn_min_run=%s) are "
+                "LatentSync diffusion-only knobs; MuseTalk accepts them but does not skip frames on yaw.",
+                payload.yaw_skip_threshold,
+                payload.yaw_rate_skip_threshold,
+                payload.side_face_episode_pre_pad,
+                payload.side_face_episode_post_pad,
+                payload.yaw_warn_threshold_ratio,
+                payload.side_face_warn_min_run_frames,
+            )
+
+        if payload.codeformer_enabled:
+            logger.info(
+                "[LipSync] codeformer_enabled=True but CodeFormer postprocess is not "
+                "available in MuseTalk; the request continues without it (set "
+                "codeformer_required=True to make this a hard error)."
+            )
+
+    @staticmethod
+    def _apply_seed_override(payload: LipSyncRequest) -> None:
+        """Apply ``seed_override`` to torch / numpy RNG. The MuseTalk
+        inference path is mostly deterministic (UNet forward + VAE
+        decode given the same input), so this is best-effort: it
+        covers torch.manual_seed and numpy.random for any code that
+        consults them on the request thread. ``-1`` means random.
+        """
+        seed = payload.seed_override
+        if seed is None:
+            return
+        if int(seed) == -1:
+            torch.seed()
+            return
+        try:
+            torch.manual_seed(int(seed))
+            np.random.seed(int(seed))
+        except Exception as exc:
+            logger.warning("[LipSync] seed_override=%s could not be applied: %s", seed, exc)
+
     @torch.no_grad()
     def synthesize(self, payload: LipSyncRequest, paths: Dict[str, Path], job_output_dir: Path) -> Dict[str, object]:
         self.load_detectors()
         with self.run_lock:
+            self._log_unsupported_fields(payload)
+            self._apply_seed_override(payload)
             frames, fps = _read_video_frames(paths["video"])
             avatar_descriptor = self._avatar_descriptor(paths["avatar"]) if paths.get("avatar") else None
             if (
@@ -2429,6 +2654,12 @@ class MuseTalkApiRuntime:
                     "passthrough_reason": "no_face_detected",
                     "source_frame_count": len(frames),
                     "output_frame_count": len(frames),
+                    "audio_frame_count": 0,
+                    "source_fps": round(float(fps), 6),
+                    "audio_feature_fps": 0.0,
+                    "audio_sync_offset_frames": 0,
+                    "audio_sync_offset_output_frames": 0,
+                    "audio_sync_offset_seconds": payload.audio_sync_offset_seconds,
                     "matched_source_frames": 0,
                     "filled_source_frames": 0,
                     "filtered_motion_frames": 0,
@@ -2440,6 +2671,8 @@ class MuseTalkApiRuntime:
                     "matched_or_filled_source_frames": 0,
                     "eligible_source_frames": 0,
                     "generated_output_frames": 0,
+                    "quality_fallback_frames": 0,
+                    "effective_generated_output_frames": 0,
                     "skipped_output_frames": len(frames),
                     "best_similarity": 0.0,
                     "target_identity_similarity": 0.0,
@@ -2447,6 +2680,61 @@ class MuseTalkApiRuntime:
                     "target_identity_coverage": 0.0,
                     "target_identity_source": "none",
                     "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
+                    # LatentSync-style stats (always zero on the no-face passthrough).
+                    "pre_skip_frames": 0,
+                    "quality_skip_frames": 0,
+                    "yaw_skip_count": 0,
+                    "yaw_rate_skip_count": 0,
+                    "mouth_occlusion_skip_count": 0,
+                    "motion_blur_skip_count": 0,
+                    "face_jump_skip_count": 0,
+                    "side_face_episode_extra_skip_count": 0,
+                    "side_face_warn_run_skip_count": 0,
+                    "silent_skip_frames": 0,
+                    "skipped_inference_batches": 0,
+                    "skipped_inference_frames": 0,
+                    "effective_guidance_scale": payload.guidance_scale_override,
+                    "effective_inference_steps": payload.inference_steps_override,
+                    "effective_seed": payload.seed_override,
+                    "identity_skip_count": 0,
+                    "identity_similarity_min": 0.0,
+                    "identity_similarity_median": 0.0,
+                    "identity_similarity_max": 0.0,
+                    "identity_similarity_threshold": float(payload.similarity_threshold),
+                    "speech_gate": {
+                        "enabled": payload.speech_gate_enabled,
+                        "active_frames": 0,
+                        "silent_frames": 0,
+                    },
+                    "mouth_temporal": {
+                        "unsupported": True,
+                        "stabilization_strength": float(payload.mouth_temporal_stabilization_strength),
+                        "stabilization_max_delta": float(payload.mouth_temporal_stabilization_max_delta),
+                        "delta_min": 0.0,
+                        "delta_median": 0.0,
+                        "delta_max": 0.0,
+                        "delta_skip_frames": 0,
+                        "stabilized_frames": 0,
+                        "audio_adaptive_motion_enabled": bool(payload.mouth_audio_adaptive_motion_enabled),
+                        "audio_motion_min_scale": float(payload.mouth_audio_motion_min_scale),
+                        "audio_motion_median_scale": 1.0,
+                        "audio_motion_max_scale": float(payload.mouth_audio_motion_max_scale),
+                    },
+                    "codeformer": {
+                        "unsupported": True,
+                        "requested": bool(payload.codeformer_enabled),
+                        "fidelity_weight": float(payload.codeformer_fidelity_weight),
+                        "required": bool(payload.codeformer_required or settings.codeformer_required),
+                        "runtime_available": False,
+                        "runtime_load_error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
+                        "checkpoint_path": settings.codeformer_checkpoint_path,
+                        "frames_total": 0,
+                        "frames_enhanced": 0,
+                        "frames_skipped_by_pipeline": 0,
+                        "elapsed_seconds": 0.0,
+                        "error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
+                    },
+                    "quality_ok": True,
                 }
             target_descriptors = target_identity.get("target_descriptors") if target_identity else []
             negative_descriptors = target_identity.get("negative_descriptors") if target_identity else []
@@ -2575,6 +2863,28 @@ class MuseTalkApiRuntime:
                 payload.speech_gate_post_roll_seconds,
                 payload.speech_gate_fill_gap_seconds,
             )
+            # Count silent frames for the LatentSync-style
+            # ``silent_skip_frames`` stat. When the speech gate is
+            # disabled every frame is "active" by definition, so
+            # silent_skip_frames is 0 and the count matches the
+            # pipeline's observed behavior.
+            if speech_activity_mask:
+                silent_skip_frames = sum(1 for active in speech_activity_mask if not active)
+            else:
+                silent_skip_frames = 0
+            if speech_gate_stats is not None and isinstance(speech_gate_stats, dict):
+                speech_gate_stats.setdefault("silent_frames", silent_skip_frames)
+            # Summary stats over the per-frame best similarity score.
+            # LatentSync publishes min/median/max identity-similarity;
+            # MuseTalk stores the per-frame "score" the same way, so
+            # expose the same summary so cross-backend dashboards can
+            # compare apples to apples.
+            nonzero_scores = [score for score in best_scores if score]
+            identity_similarity_min = float(min(nonzero_scores)) if nonzero_scores else 0.0
+            identity_similarity_median = (
+                float(np.median(nonzero_scores)) if nonzero_scores else 0.0
+            )
+            identity_similarity_max = float(max(nonzero_scores)) if nonzero_scores else 0.0
 
             latents_by_frame = self._encode_latents(frames, targets, payload.extra_margin)
             process_items = []
@@ -2664,6 +2974,76 @@ class MuseTalkApiRuntime:
                 "target_identity_source": target_identity_source,
                 "face_identity_backend": face_identity_backend,
                 "speech_gate": speech_gate_stats,
+                # --- LatentSync-style per-frame filter / pre-skip stats ---
+                # MuseTalk's encoder-decoder pipeline does not perform
+                # yaw / occlusion / motion-blur / face-jump / side-face
+                # episode filtering -- those knobs are diffusion-only and
+                # are accepted on the wire but ignored at runtime (see
+                # ``_log_unsupported_fields``). We report zeros so
+                # cross-backend dashboards have stable columns.
+                "pre_skip_frames": 0,
+                "quality_skip_frames": 0,
+                "yaw_skip_count": 0,
+                "yaw_rate_skip_count": 0,
+                "mouth_occlusion_skip_count": 0,
+                "motion_blur_skip_count": 0,
+                "face_jump_skip_count": 0,
+                "side_face_episode_extra_skip_count": 0,
+                "side_face_warn_run_skip_count": 0,
+                "silent_skip_frames": silent_skip_frames,
+                "skipped_inference_batches": 0,
+                "skipped_inference_frames": 0,
+                # --- LatentSync-style inference overrides (no-op in MuseTalk) ---
+                "effective_guidance_scale": payload.guidance_scale_override,
+                "effective_inference_steps": payload.inference_steps_override,
+                "effective_seed": payload.seed_override,
+                # --- Per-frame identity similarity summary (matches the
+                #     LatentSync response schema; computed from
+                #     ``best_scores`` collected during target selection). ---
+                "identity_skip_count": 0,
+                "identity_similarity_min": identity_similarity_min,
+                "identity_similarity_median": identity_similarity_median,
+                "identity_similarity_max": identity_similarity_max,
+                "identity_similarity_threshold": float(payload.similarity_threshold),
+                # --- Mouth temporal stabilization (diffusion-only stat) ---
+                # MuseTalk is a single-step encoder-decoder; there is no
+                # per-frame delta to stabilize. We echo the request
+                # settings back so the dashboard's "current run config"
+                # panel still shows the caller's intent, and mark the
+                # block unsupported so consumers can branch on it.
+                "mouth_temporal": {
+                    "unsupported": True,
+                    "stabilization_strength": float(payload.mouth_temporal_stabilization_strength),
+                    "stabilization_max_delta": float(payload.mouth_temporal_stabilization_max_delta),
+                    "delta_min": 0.0,
+                    "delta_median": 0.0,
+                    "delta_max": 0.0,
+                    "delta_skip_frames": 0,
+                    "stabilized_frames": 0,
+                    "audio_adaptive_motion_enabled": bool(payload.mouth_audio_adaptive_motion_enabled),
+                    "audio_motion_min_scale": float(payload.mouth_audio_motion_min_scale),
+                    "audio_motion_median_scale": 1.0,
+                    "audio_motion_max_scale": float(payload.mouth_audio_motion_max_scale),
+                },
+                # --- CodeFormer postprocess (diffusion-only stat) ---
+                # Always unsupported in MuseTalk. The block shape matches
+                # LatentSync's response so the frontend can render the
+                # same status card without branching on backend.
+                "codeformer": {
+                    "unsupported": True,
+                    "requested": bool(payload.codeformer_enabled),
+                    "fidelity_weight": float(payload.codeformer_fidelity_weight),
+                    "required": bool(payload.codeformer_required or settings.codeformer_required),
+                    "runtime_available": False,
+                    "runtime_load_error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
+                    "checkpoint_path": settings.codeformer_checkpoint_path,
+                    "frames_total": 0,
+                    "frames_enhanced": 0,
+                    "frames_skipped_by_pipeline": 0,
+                    "elapsed_seconds": 0.0,
+                    "error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
+                },
+                "quality_ok": True,
             }
 
 
@@ -2705,6 +3085,12 @@ def health() -> Dict[str, object]:
         "face_embedding_backend": settings.face_embedding_backend,
         "face_embedding_error": runtime.face_embedding_error,
         "port": settings.port,
+        "codeformer": {
+            "checkpoint_path": settings.codeformer_checkpoint_path,
+            "loaded": False,
+            "preload_requested": settings.codeformer_preload,
+            "load_error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
+        },
     }
 
 
