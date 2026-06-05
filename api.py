@@ -200,7 +200,7 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.5, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.38, ge=0.0, le=1.0)
     identity_margin: float = Field(0.05, ge=0.0, le=1.0)
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
@@ -213,12 +213,12 @@ class LipSyncRequest(BaseModel):
     target_fill_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
     target_fill_max_center_shift: float = Field(0.8, ge=0.0, le=5.0)
     target_motion_gate_enabled: bool = True
-    target_motion_max_center_shift: float = Field(0.30, ge=0.0, le=5.0)
-    target_motion_max_scale_change: float = Field(0.25, ge=0.0, le=2.0)
+    target_motion_max_center_shift: float = Field(0.45, ge=0.0, le=5.0)
+    target_motion_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
     target_fast_motion_gate_enabled: bool = True
     target_fast_motion_max_center_shift_per_frame: float = Field(0.12, ge=0.0, le=2.0)
     target_fast_motion_max_scale_change_per_frame: float = Field(0.08, ge=0.0, le=2.0)
-    target_fast_motion_min_run_frames: int = Field(5, ge=1, le=120)
+    target_fast_motion_min_run_frames: int = Field(3, ge=1, le=120)
     lipsync_continuity_max_gap_seconds: float = Field(0.35, ge=0.0, le=2.0)
     lipsync_continuity_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
     lipsync_continuity_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
@@ -244,7 +244,7 @@ class LipSyncRequest(BaseModel):
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
-    lipsync_min_segment_frames: int = Field(5, ge=1, le=300)
+    lipsync_min_segment_frames: int = Field(3, ge=1, le=300)
     lipsync_min_face_area_ratio: float = Field(0.015, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
