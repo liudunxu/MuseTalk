@@ -1,3 +1,6 @@
+import os
+os.environ["NO_ALBUMENTATIONS_UPDATE"] = "1"
+
 import argparse
 import logging
 import math
