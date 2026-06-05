@@ -2983,11 +2983,17 @@ class MuseTalkApiRuntime:
                 if restorer is not None and restorer.is_loaded:
                     codeformer_stats["runtime_available"] = True
                     # Build a (T, 3, H, W) tensor in [-1, 1] from generated BGR faces.
+                    # CodeFormer expects 512x512 input; MuseTalk produces 256x256
+                    # faces so we upsample before the model and downsample after.
+                    CODEFORMER_INPUT_SIZE = 512
                     sorted_indices = sorted(generated.keys())
+                    original_sizes = []
                     face_tensors = []
                     for idx in sorted_indices:
                         face_bgr = generated[idx]  # (H, W, 3) BGR uint8
-                        face_rgb = face_bgr[..., ::-1]  # RGB
+                        original_sizes.append((face_bgr.shape[0], face_bgr.shape[1]))
+                        face_bgr_512 = cv2.resize(face_bgr, (CODEFORMER_INPUT_SIZE, CODEFORMER_INPUT_SIZE), interpolation=cv2.INTER_LANCZOS4)
+                        face_rgb = face_bgr_512[..., ::-1]  # RGB
                         face_float = face_rgb.astype(np.float32) / 255.0 * 2.0 - 1.0  # [-1, 1]
                         face_chw = np.transpose(face_float, (2, 0, 1))  # (3, H, W)
                         face_tensors.append(face_chw)
@@ -2997,14 +3003,18 @@ class MuseTalkApiRuntime:
                         fidelity_weight=payload.codeformer_fidelity_weight,
                         adain=payload.codeformer_adain,
                     )
-                    # Write restored faces back into the generated dict as BGR uint8.
+                    # Write restored faces back into the generated dict as BGR uint8,
+                    # resizing from 512x512 back to the original face crop size.
                     restored_np = restored_batch.cpu().numpy()
                     for i, idx in enumerate(sorted_indices):
-                        face_out = restored_np[i]  # (3, H, W) in [-1, 1]
-                        face_out = np.transpose(face_out, (1, 2, 0))  # (H, W, 3) RGB
+                        face_out = restored_np[i]  # (3, 512, 512) in [-1, 1]
+                        face_out = np.transpose(face_out, (1, 2, 0))  # (512, 512, 3) RGB
                         face_out = ((face_out + 1.0) / 2.0 * 255.0)
                         face_out = np.clip(face_out, 0, 255).astype(np.uint8)
                         face_out = face_out[..., ::-1]  # RGB -> BGR
+                        orig_h, orig_w = original_sizes[i]
+                        if face_out.shape[0] != orig_h or face_out.shape[1] != orig_w:
+                            face_out = cv2.resize(face_out, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
                         generated[idx] = face_out
                     codeformer_stats.update(cf_stats.as_dict())
                     codeformer_stats["runtime_available"] = True
