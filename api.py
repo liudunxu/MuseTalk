@@ -200,23 +200,23 @@ class LipSyncRequest(BaseModel):
     video_url: str = Field(..., description="Source video URL")
     avatar_url: Optional[str] = Field(None, description="Reference avatar image URL")
     audio_url: str = Field(..., description="Driving audio URL")
-    similarity_threshold: float = Field(0.38, ge=0.0, le=1.0)
-    identity_margin: float = Field(0.05, ge=0.0, le=1.0)
+    similarity_threshold: float = Field(0.35, ge=0.0, le=1.0)
+    identity_margin: float = Field(0.03, ge=0.0, le=1.0)
     identity_cluster_threshold: float = Field(0.78, ge=0.0, le=1.0)
     default_identity_min_coverage: float = Field(0.5, ge=0.0, le=1.0)
     require_face_embedding: bool = True
     allow_crop_embedding_fallback: bool = True
     crop_embedding_min_detection_score: float = Field(0.0, ge=0.0, le=1.0)
     temporal_tracking_weight: float = Field(0.08, ge=0.0, le=0.5)
-    target_fill_max_gap_seconds: float = Field(0.6, ge=0.0, le=3.0)
+    target_fill_max_gap_seconds: float = Field(0.8, ge=0.0, le=3.0)
     target_fill_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
     target_fill_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
     target_fill_max_center_shift: float = Field(0.8, ge=0.0, le=5.0)
     target_motion_gate_enabled: bool = True
-    target_motion_max_center_shift: float = Field(0.45, ge=0.0, le=5.0)
+    target_motion_max_center_shift: float = Field(0.60, ge=0.0, le=5.0)
     target_motion_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
     target_fast_motion_gate_enabled: bool = True
-    target_fast_motion_max_center_shift_per_frame: float = Field(0.12, ge=0.0, le=2.0)
+    target_fast_motion_max_center_shift_per_frame: float = Field(0.15, ge=0.0, le=2.0)
     target_fast_motion_max_scale_change_per_frame: float = Field(0.08, ge=0.0, le=2.0)
     target_fast_motion_min_run_frames: int = Field(3, ge=1, le=120)
     lipsync_continuity_max_gap_seconds: float = Field(0.35, ge=0.0, le=2.0)
@@ -244,16 +244,16 @@ class LipSyncRequest(BaseModel):
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
-    lipsync_min_segment_frames: int = Field(3, ge=1, le=300)
-    lipsync_min_face_area_ratio: float = Field(0.015, ge=0.0, le=1.0)
+    lipsync_min_segment_frames: int = Field(2, ge=1, le=300)
+    lipsync_min_face_area_ratio: float = Field(0.010, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
     blend_mask_blur_ratio: float = Field(0.01, ge=0.0, le=0.2)
-    color_match_strength: float = Field(0.60, ge=0.0, le=1.0)
-    mouth_detail_strength: float = Field(0.65, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.0, ge=0.0, le=1.0)
+    color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
+    mouth_detail_strength: float = Field(0.75, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.10, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     mouth_audio_adaptive_motion_enabled: bool = True
@@ -358,8 +358,8 @@ class LipSyncRequest(BaseModel):
     # mask out soft speech on noisy audio. The MuseTalk impl remains
     # available; clients that want it can opt in.
     speech_gate_enabled: bool = False
-    speech_gate_relative_db: float = Field(-42.0, ge=-80.0, le=0.0)
-    speech_gate_min_rms: float = Field(0.00035, ge=0.0, le=1.0)
+    speech_gate_relative_db: float = Field(-38.0, ge=-80.0, le=0.0)
+    speech_gate_min_rms: float = Field(0.0005, ge=0.0, le=1.0)
     speech_gate_window_seconds: float = Field(0.12, ge=0.02, le=0.5)
     speech_gate_pre_roll_seconds: float = Field(0.04, ge=0.0, le=1.0)
     speech_gate_post_roll_seconds: float = Field(0.12, ge=0.0, le=1.0)
