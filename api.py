@@ -84,11 +84,11 @@ class Settings:
     )
     face_embedding_det_size: int = int(os.getenv("MUSETALK_FACE_EMBEDDING_DET_SIZE", "640"))
     progress_enabled: bool = os.getenv("API_PROGRESS", "1").lower() not in {"0", "false", "no", "off"}
-    # CodeFormer face-restoration postprocess (accepted for LatentSync
-    # client compatibility). MuseTalk is encoder-decoder and has no
-    # CodeFormer integration; these env vars are surfaced in the
-    # ``/health`` response and the lipsync response ``codeformer`` block.
-    codeformer_checkpoint_path: str = os.getenv("MUSETALK_CODEFORMER_CKPT", "")
+    # CodeFormer face-restoration postprocess.
+    codeformer_checkpoint_path: str = os.getenv(
+        "MUSETALK_CODEFORMER_CKPT",
+        str(PROJECT_DIR / "models" / "codeformer" / "codeformer.pth"),
+    )
     codeformer_preload: bool = os.getenv("MUSETALK_CODEFORMER_PRELOAD", "0").lower() in {"1", "true", "yes"}
     codeformer_batch_size: int = int(os.getenv("MUSETALK_CODEFORMER_BATCH_SIZE", "8"))
     codeformer_required: bool = os.getenv("MUSETALK_CODEFORMER_REQUIRED", "0").lower() in {"1", "true", "yes"}
@@ -364,20 +364,20 @@ class LipSyncRequest(BaseModel):
     speech_gate_pre_roll_seconds: float = Field(0.04, ge=0.0, le=1.0)
     speech_gate_post_roll_seconds: float = Field(0.12, ge=0.0, le=1.0)
     speech_gate_fill_gap_seconds: float = Field(0.16, ge=0.0, le=1.0)
-    # --- CodeFormer face-restoration postprocess (added for LatentSync parity) ---
-    # MuseTalk is an encoder-decoder model, not a diffusion inpainter, so
-    # the CodeFormer postprocess is not available. The fields below are
-    # accepted on the wire for cross-backend client compatibility; the
-    # response always reports ``codeformer.unsupported=True``.
+    # --- CodeFormer face-restoration postprocess ---
     codeformer_enabled: bool = Field(
         False,
-        description="Run CodeFormer face restoration on the aligned face crops before paste-back. (Diffusion-only; not available in MuseTalk.)",
+        description="Run CodeFormer face restoration on the aligned face crops before paste-back.",
     )
     codeformer_fidelity_weight: float = Field(
         0.5,
         ge=0.0,
         le=1.0,
         description="CodeFormer fidelity weight. 0 = sharpest, 1 = closest to input. 0.5 is the upstream default.",
+    )
+    codeformer_adain: bool = Field(
+        True,
+        description="Apply adaptive instance normalization so restored face color matches input.",
     )
     codeformer_required: bool = Field(
         settings.codeformer_required,
@@ -726,6 +726,9 @@ class MuseTalkApiRuntime:
         self.face_recognition_output_name = ""
         self.face_embedding_loaded = False
         self.face_embedding_error = ""
+        self.codeformer_restorer = None
+        self.codeformer_load_attempted = False
+        self.codeformer_load_error = ""
 
     def load_detectors(self) -> None:
         if self.detectors_loaded:
@@ -810,6 +813,48 @@ class MuseTalkApiRuntime:
             self.face_embedding_error = str(exc)
             self.face_recognition_session = None
 
+    def _get_codeformer_restorer(self):
+        """Return the singleton CodeFormerRestorer, building it on first call."""
+        if self.codeformer_restorer is not None:
+            return self.codeformer_restorer, ""
+        if self.codeformer_load_attempted and self.codeformer_load_error:
+            # Retry if the checkpoint appeared on disk after the first attempt.
+            if os.path.isfile(settings.codeformer_checkpoint_path):
+                self.codeformer_load_error = ""
+                self.codeformer_load_attempted = False
+            else:
+                return None, self.codeformer_load_error
+        self.codeformer_load_attempted = True
+        try:
+            from musetalk.utils.codeformer_restorer import CodeFormerRestorer
+        except Exception as exc:
+            self.codeformer_load_error = f"failed to import musetalk.utils.codeformer_restorer: {exc}"
+            logger.exception("[CodeFormer] %s", self.codeformer_load_error)
+            return None, self.codeformer_load_error
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.codeformer_restorer = CodeFormerRestorer(
+            checkpoint_path=settings.codeformer_checkpoint_path,
+            device=device,
+            batch_size=settings.codeformer_batch_size,
+        )
+        # Eagerly probe the load so we surface errors early.
+        if not settings.codeformer_checkpoint_path or not os.path.isfile(settings.codeformer_checkpoint_path):
+            self.codeformer_load_error = (
+                f"CodeFormer checkpoint not found at {settings.codeformer_checkpoint_path!r}"
+            )
+            logger.warning("[CodeFormer] %s", self.codeformer_load_error)
+        else:
+            try:
+                self.codeformer_restorer._ensure_loaded()
+                if self.codeformer_restorer.is_loaded:
+                    logger.info("[CodeFormer] Preloaded successfully")
+                else:
+                    self.codeformer_load_error = self.codeformer_restorer.load_error
+            except Exception as exc:
+                self.codeformer_load_error = f"CodeFormer load failed: {exc}"
+                logger.exception("[CodeFormer] %s", self.codeformer_load_error)
+        return self.codeformer_restorer, self.codeformer_load_error
+
     def load(self) -> None:
         if self.loaded:
             return
@@ -848,6 +893,11 @@ class MuseTalkApiRuntime:
             self.whisper = WhisperModel.from_pretrained(settings.whisper_dir)
             self.whisper = self.whisper.to(device=self.device, dtype=self.weight_dtype).eval()
             self.whisper.requires_grad_(False)
+
+            if settings.codeformer_preload:
+                logger.info("[CodeFormer] Preloading CodeFormer model as requested...")
+                self._get_codeformer_restorer()
+
             self.loaded = True
 
     def _get_face_parser(self, left_cheek_width: int, right_cheek_width: int) -> FaceParsing:
@@ -2604,12 +2654,13 @@ class MuseTalkApiRuntime:
                 payload.side_face_warn_min_run_frames,
             )
 
-        if payload.codeformer_enabled:
-            logger.info(
-                "[LipSync] codeformer_enabled=True but CodeFormer postprocess is not "
-                "available in MuseTalk; the request continues without it (set "
-                "codeformer_required=True to make this a hard error)."
-            )
+        if payload.codeformer_enabled and settings.codeformer_required:
+            restorer, load_error = self._get_codeformer_restorer()
+            if restorer is None or not restorer.is_loaded:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"CodeFormer is required but not available: {load_error or 'model not loaded'}",
+                )
 
     @staticmethod
     def _apply_seed_override(payload: LipSyncRequest) -> None:
@@ -2724,18 +2775,19 @@ class MuseTalkApiRuntime:
                         "audio_motion_max_scale": float(payload.mouth_audio_motion_max_scale),
                     },
                     "codeformer": {
-                        "unsupported": True,
                         "requested": bool(payload.codeformer_enabled),
                         "fidelity_weight": float(payload.codeformer_fidelity_weight),
+                        "adain": bool(payload.codeformer_adain),
                         "required": bool(payload.codeformer_required or settings.codeformer_required),
                         "runtime_available": False,
-                        "runtime_load_error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
+                        "runtime_load_error": "",
                         "checkpoint_path": settings.codeformer_checkpoint_path,
                         "frames_total": 0,
                         "frames_enhanced": 0,
+                        "frames_fallback": 0,
                         "frames_skipped_by_pipeline": 0,
                         "elapsed_seconds": 0.0,
-                        "error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
+                        "error": "no target face detected -- CodeFormer skipped",
                     },
                     "quality_ok": True,
                 }
@@ -2910,6 +2962,62 @@ class MuseTalkApiRuntime:
 
             generated = self._run_inference_batches(process_items, payload.batch_size) if process_items else {}
 
+            # --- CodeFormer face restoration ---
+            codeformer_stats = {
+                "requested": bool(payload.codeformer_enabled),
+                "fidelity_weight": float(payload.codeformer_fidelity_weight),
+                "adain": bool(payload.codeformer_adain),
+                "required": bool(payload.codeformer_required or settings.codeformer_required),
+                "runtime_available": False,
+                "runtime_load_error": "",
+                "checkpoint_path": settings.codeformer_checkpoint_path,
+                "frames_total": 0,
+                "frames_enhanced": 0,
+                "frames_fallback": 0,
+                "frames_skipped_by_pipeline": 0,
+                "elapsed_seconds": 0.0,
+                "error": "",
+            }
+            if payload.codeformer_enabled and generated:
+                restorer, load_error = self._get_codeformer_restorer()
+                if restorer is not None and restorer.is_loaded:
+                    codeformer_stats["runtime_available"] = True
+                    # Build a (T, 3, H, W) tensor in [-1, 1] from generated BGR faces.
+                    sorted_indices = sorted(generated.keys())
+                    face_tensors = []
+                    for idx in sorted_indices:
+                        face_bgr = generated[idx]  # (H, W, 3) BGR uint8
+                        face_rgb = face_bgr[..., ::-1]  # RGB
+                        face_float = face_rgb.astype(np.float32) / 255.0 * 2.0 - 1.0  # [-1, 1]
+                        face_chw = np.transpose(face_float, (2, 0, 1))  # (3, H, W)
+                        face_tensors.append(face_chw)
+                    face_batch = torch.from_numpy(np.stack(face_tensors, axis=0)).to(self.device)
+                    restored_batch, cf_stats = restorer.restore_faces(
+                        face_batch,
+                        fidelity_weight=payload.codeformer_fidelity_weight,
+                        adain=payload.codeformer_adain,
+                    )
+                    # Write restored faces back into the generated dict as BGR uint8.
+                    restored_np = restored_batch.cpu().numpy()
+                    for i, idx in enumerate(sorted_indices):
+                        face_out = restored_np[i]  # (3, H, W) in [-1, 1]
+                        face_out = np.transpose(face_out, (1, 2, 0))  # (H, W, 3) RGB
+                        face_out = ((face_out + 1.0) / 2.0 * 255.0)
+                        face_out = np.clip(face_out, 0, 255).astype(np.uint8)
+                        face_out = face_out[..., ::-1]  # RGB -> BGR
+                        generated[idx] = face_out
+                    codeformer_stats.update(cf_stats.as_dict())
+                    codeformer_stats["runtime_available"] = True
+                    codeformer_stats["runtime_load_error"] = ""
+                else:
+                    codeformer_stats["runtime_available"] = False
+                    codeformer_stats["runtime_load_error"] = load_error or "CodeFormer model not loaded"
+                    codeformer_stats["error"] = load_error or "CodeFormer model not loaded"
+                    logger.warning(
+                        "[LipSync] codeformer_enabled=True but CodeFormer is not available: %s",
+                        load_error or "model not loaded",
+                    )
+
             face_parser = (
                 self._get_face_parser(payload.left_cheek_width, payload.right_cheek_width)
                 if generated
@@ -3028,24 +3136,7 @@ class MuseTalkApiRuntime:
                     "audio_motion_median_scale": 1.0,
                     "audio_motion_max_scale": float(payload.mouth_audio_motion_max_scale),
                 },
-                # --- CodeFormer postprocess (diffusion-only stat) ---
-                # Always unsupported in MuseTalk. The block shape matches
-                # LatentSync's response so the frontend can render the
-                # same status card without branching on backend.
-                "codeformer": {
-                    "unsupported": True,
-                    "requested": bool(payload.codeformer_enabled),
-                    "fidelity_weight": float(payload.codeformer_fidelity_weight),
-                    "required": bool(payload.codeformer_required or settings.codeformer_required),
-                    "runtime_available": False,
-                    "runtime_load_error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
-                    "checkpoint_path": settings.codeformer_checkpoint_path,
-                    "frames_total": 0,
-                    "frames_enhanced": 0,
-                    "frames_skipped_by_pipeline": 0,
-                    "elapsed_seconds": 0.0,
-                    "error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
-                },
+                "codeformer": codeformer_stats,
                 "quality_ok": True,
             }
 
@@ -3090,9 +3181,9 @@ def health() -> Dict[str, object]:
         "port": settings.port,
         "codeformer": {
             "checkpoint_path": settings.codeformer_checkpoint_path,
-            "loaded": False,
+            "loaded": runtime.codeformer_restorer is not None and runtime.codeformer_restorer.is_loaded,
             "preload_requested": settings.codeformer_preload,
-            "load_error": "CodeFormer postprocess is not available in MuseTalk (encoder-decoder model).",
+            "load_error": runtime.codeformer_load_error or "",
         },
     }
 
