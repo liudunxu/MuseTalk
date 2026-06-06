@@ -213,30 +213,29 @@ class LipSyncRequest(BaseModel):
     target_fill_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
     target_fill_max_center_shift: float = Field(0.8, ge=0.0, le=5.0)
     target_motion_gate_enabled: bool = True
-    target_motion_max_center_shift: float = Field(0.60, ge=0.0, le=5.0)
-    target_motion_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
+    target_motion_max_center_shift: float = Field(0.80, ge=0.0, le=5.0)
+    target_motion_max_scale_change: float = Field(0.45, ge=0.0, le=2.0)
     target_fast_motion_gate_enabled: bool = True
-    target_fast_motion_max_center_shift_per_frame: float = Field(0.15, ge=0.0, le=2.0)
-    target_fast_motion_max_scale_change_per_frame: float = Field(0.08, ge=0.0, le=2.0)
-    target_fast_motion_min_run_frames: int = Field(3, ge=1, le=120)
-    lipsync_continuity_max_gap_seconds: float = Field(0.35, ge=0.0, le=2.0)
-    lipsync_continuity_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
-    lipsync_continuity_max_scale_change: float = Field(0.35, ge=0.0, le=2.0)
+    target_fast_motion_max_center_shift_per_frame: float = Field(0.25, ge=0.0, le=2.0)
+    target_fast_motion_max_scale_change_per_frame: float = Field(0.15, ge=0.0, le=2.0)
+    target_fast_motion_min_run_frames: int = Field(2, ge=1, le=120)
+    lipsync_continuity_max_gap_seconds: float = Field(0.60, ge=0.0, le=2.0)
+    lipsync_continuity_max_center_shift: float = Field(0.50, ge=0.0, le=5.0)
+    lipsync_continuity_max_scale_change: float = Field(0.45, ge=0.0, le=2.0)
     # Mouth-region pixel diff break: complementary to the embedding
     # similarity check. When the mouth region mean abs diff between
     # consecutive aligned face crops exceeds this fraction, treat the
     # next frame as a continuity break -- catches face switches the
     # embedding check misses (similar-looking people, side faces).
-    # 0 disables. Default 0.10 is above same-person expression/pose
-    # diff (~0.02-0.05) and below cross-person diff (~0.10-0.30).
-    # MuseTalk accepts the field for API compatibility; the diff
-    # break itself is not currently enforced at runtime.
+    # 0 disables. Default 0.30 sits at the upper end of cross-person
+    # diff (0.10-0.30) so it only fires on hard face switches; raise
+    # further or set to 0 to effectively disable.
     lipsync_mouth_diff_break_threshold: float = Field(
-        0.10, ge=0.0, le=1.0,
+        0.30, ge=0.0, le=1.0,
         description="Mouth-region mean abs diff break threshold; 0 disables.",
     )
     target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
-    target_bbox_smoothing_max_center_shift: float = Field(0.35, ge=0.0, le=5.0)
+    target_bbox_smoothing_max_center_shift: float = Field(0.50, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
@@ -244,8 +243,8 @@ class LipSyncRequest(BaseModel):
     require_landmark_match: bool = True
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
-    lipsync_min_segment_frames: int = Field(2, ge=1, le=300)
-    lipsync_min_face_area_ratio: float = Field(0.010, ge=0.0, le=1.0)
+    lipsync_min_segment_frames: int = Field(1, ge=1, le=300)
+    lipsync_min_face_area_ratio: float = Field(0.005, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
     parsing_mode: str = "jaw"
