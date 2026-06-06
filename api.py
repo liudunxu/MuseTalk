@@ -488,6 +488,35 @@ def _validate_url(url: str) -> None:
         raise HTTPException(status_code=400, detail=f"Invalid URL: {url}")
 
 
+def _describe_target_identity_source(
+    avatar_descriptor: Optional[Dict[str, object]],
+    target_identity: Optional[Dict[str, object]],
+) -> str:
+    """Return a human-readable label for the response field
+    `target_identity_source`.
+
+    Possible values:
+      - "avatar": avatar provided AND a matching cluster was found.
+      - "avatar_fallback:<most_frequent_face|first_largest_face>":
+        avatar was provided but no cluster cleared the similarity
+        threshold, so we fell back to the no-avatar heuristic.
+      - "<most_frequent_face|first_largest_face>": no avatar
+        provided; heuristic pick from the source video.
+      - "none": no face detected in the source video (passthrough).
+    """
+    if target_identity is None:
+        return "none"
+    selection_source = target_identity.get("selection_source")
+    if avatar_descriptor is not None and selection_source in (
+        "most_frequent_face",
+        "first_largest_face",
+    ):
+        return f"avatar_fallback:{selection_source}"
+    if avatar_descriptor is not None:
+        return "avatar"
+    return str(selection_source or "most_frequent_face")
+
+
 class _RetryableDownloadError(Exception):
     pass
 
@@ -1748,35 +1777,7 @@ class MuseTalkApiRuntime:
             }
 
         if avatar_descriptor is None:
-            clusters.sort(
-                key=lambda item: (int(item["count"]), int(item["max_area"])),
-                reverse=True,
-            )
-            best_cluster = clusters[0]
-            most_frequent_coverage = int(best_cluster["count"]) / max(1, scanned_identity_frames)
-            if most_frequent_coverage < payload.default_identity_min_coverage:
-                clusters.sort(
-                    key=lambda item: (
-                        -int(item.get("first_frame_index", item["best_frame_index"])),
-                        int(item.get("first_area", item["max_area"])),
-                    ),
-                    reverse=True,
-                )
-                best_cluster = clusters[0]
-                selection_source = "first_largest_face"
-            else:
-                selection_source = "most_frequent_face"
-            identity_coverage = int(best_cluster["count"]) / max(1, scanned_identity_frames)
-            best_cluster["avatar_score"] = 0.0
-            best_cluster["selection_source"] = selection_source
-            best_cluster["identity_coverage"] = identity_coverage
-            best_cluster["most_frequent_identity_coverage"] = most_frequent_coverage
-            best_cluster["target_descriptors"] = list(best_cluster.get("descriptors") or [])
-            negative_descriptors = []
-            for cluster in clusters[1:]:
-                negative_descriptors.extend(cluster.get("descriptors") or [])
-            best_cluster["negative_descriptors"] = negative_descriptors
-            return best_cluster
+            return self._pick_cluster_without_avatar(clusters, scanned_identity_frames, payload)
 
         for cluster in clusters:
             descriptors = cluster.get("descriptors") or []
@@ -1795,7 +1796,12 @@ class MuseTalkApiRuntime:
         )
         best_cluster = clusters[0]
         if float(best_cluster["avatar_score"]) < payload.similarity_threshold:
-            return None
+            # Avatar was provided but no cluster in the source video
+            # matched it. Fall back to the same heuristic the no-avatar
+            # path uses (most-frequent / first-largest) instead of
+            # hard-stopping with zero matching frames and a misleading
+            # `target_identity_source = "avatar"`.
+            return self._pick_cluster_without_avatar(clusters, scanned_identity_frames, payload)
 
         target_descriptors = [
             descriptor
@@ -1808,6 +1814,48 @@ class MuseTalkApiRuntime:
         for cluster in clusters[1:]:
             negative_descriptors.extend(cluster.get("descriptors") or [])
         best_cluster["target_descriptors"] = target_descriptors
+        best_cluster["negative_descriptors"] = negative_descriptors
+        return best_cluster
+
+    def _pick_cluster_without_avatar(
+        self,
+        clusters: List[Dict[str, object]],
+        scanned_identity_frames: int,
+        payload: LipSyncRequest,
+    ) -> Dict[str, object]:
+        """Pick a target face cluster using only the source video.
+
+        Used both when no avatar is provided AND when the avatar was
+        provided but no cluster in the source video cleared the
+        similarity threshold (fallback path).
+        """
+        clusters.sort(
+            key=lambda item: (int(item["count"]), int(item["max_area"])),
+            reverse=True,
+        )
+        best_cluster = clusters[0]
+        most_frequent_coverage = int(best_cluster["count"]) / max(1, scanned_identity_frames)
+        if most_frequent_coverage < payload.default_identity_min_coverage:
+            clusters.sort(
+                key=lambda item: (
+                    -int(item.get("first_frame_index", item["best_frame_index"])),
+                    int(item.get("first_area", item["max_area"])),
+                ),
+                reverse=True,
+            )
+            best_cluster = clusters[0]
+            selection_source = "first_largest_face"
+        else:
+            selection_source = "most_frequent_face"
+        identity_coverage = int(best_cluster["count"]) / max(1, scanned_identity_frames)
+        best_cluster["avatar_score"] = 0.0
+        best_cluster["selection_source"] = selection_source
+        best_cluster["identity_coverage"] = identity_coverage
+        best_cluster["most_frequent_identity_coverage"] = most_frequent_coverage
+        best_cluster["target_descriptors"] = list(best_cluster.get("descriptors") or [])
+        negative_descriptors = []
+        for cluster in clusters[1:]:
+            negative_descriptors.extend(cluster.get("descriptors") or [])
         best_cluster["negative_descriptors"] = negative_descriptors
         return best_cluster
 
@@ -2885,9 +2933,7 @@ class MuseTalkApiRuntime:
             target_identity_coverage = float(target_identity.get("identity_coverage", 0.0)) if target_identity else 0.0
             face_identity_backend = "embedding" if payload.require_face_embedding else "visual"
             target_identity_source = (
-                "avatar"
-                if avatar_descriptor is not None
-                else str(target_identity.get("selection_source", "most_frequent_face")) if target_identity else "none"
+                _describe_target_identity_source(avatar_descriptor, target_identity)
             )
 
             targets = []
@@ -3339,9 +3385,19 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
 
     video_path = _download_to_file(payload.video_url, job_input_dir, "video", VIDEO_SUFFIXES, ".mp4")
     audio_path = _download_to_file(payload.audio_url, job_input_dir, "audio", AUDIO_SUFFIXES, ".wav")
+    # Distinguish "client did not send the field" (None -> auto-detect
+    # reference face from the source video) from "client sent an empty
+    # string" (almost certainly a bug -> fail loudly with 400). The
+    # old `if payload.avatar_url` truthiness check conflated the two
+    # and silently fell back when a client sent avatar_url: "".
+    if payload.avatar_url is not None and not payload.avatar_url.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="avatar_url must not be empty; omit the field to use auto-detected reference face.",
+        )
     avatar_path = (
         _download_to_file(payload.avatar_url, job_input_dir, "avatar", IMAGE_SUFFIXES, ".jpg")
-        if payload.avatar_url
+        if payload.avatar_url is not None
         else None
     )
 
