@@ -216,11 +216,11 @@ class LipSyncRequest(BaseModel):
     target_motion_max_center_shift: float = Field(1.30, ge=0.0, le=5.0)
     target_motion_max_scale_change: float = Field(0.70, ge=0.0, le=2.0)
     target_fast_motion_gate_enabled: bool = True
-    target_fast_motion_max_center_shift_per_frame: float = Field(0.50, ge=0.0, le=2.0)
-    target_fast_motion_max_scale_change_per_frame: float = Field(0.30, ge=0.0, le=2.0)
+    target_fast_motion_max_center_shift_per_frame: float = Field(0.35, ge=0.0, le=2.0)
+    target_fast_motion_max_scale_change_per_frame: float = Field(0.20, ge=0.0, le=2.0)
     target_fast_motion_min_run_frames: int = Field(2, ge=1, le=120)
-    lipsync_continuity_max_gap_seconds: float = Field(0.80, ge=0.0, le=2.0)
-    lipsync_continuity_max_center_shift: float = Field(0.85, ge=0.0, le=5.0)
+    lipsync_continuity_max_gap_seconds: float = Field(1.20, ge=0.0, le=2.0)
+    lipsync_continuity_max_center_shift: float = Field(1.00, ge=0.0, le=5.0)
     lipsync_continuity_max_scale_change: float = Field(0.70, ge=0.0, le=2.0)
     # Independent knobs for the second-pass continuity fill so it
     # does not silently inherit the initial gap-fill's window /
@@ -228,7 +228,7 @@ class LipSyncRequest(BaseModel):
     # mouth-diff filters, so it usually wants a slightly larger
     # window and a lower match ratio to recover bridged segments.
     lipsync_continuity_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
-    lipsync_continuity_min_match_ratio: float = Field(0.30, ge=0.0, le=1.0)
+    lipsync_continuity_min_match_ratio: float = Field(0.20, ge=0.0, le=1.0)
     # Mouth-region pixel diff break: complementary to the embedding
     # similarity check. When the mouth region mean abs diff between
     # consecutive aligned face crops exceeds this fraction, treat the
@@ -243,8 +243,8 @@ class LipSyncRequest(BaseModel):
         0.60, ge=0.0, le=1.0,
         description="Mouth-region mean abs diff break threshold; 0 disables.",
     )
-    target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
-    target_bbox_smoothing_max_center_shift: float = Field(0.65, ge=0.0, le=5.0)
+    target_bbox_smoothing_window: int = Field(5, ge=1, le=15)
+    target_bbox_smoothing_max_center_shift: float = Field(0.85, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
@@ -378,6 +378,20 @@ class LipSyncRequest(BaseModel):
         ge=0.0,
         le=2000.0,
         description="Source-face Laplacian floor. 0 disables. Frame is skipped (passthrough) if the source face-crop variance is below this.",
+    )
+    # Side-face (near-profile) prefilter. When the detected face
+    # bbox's width/height aspect ratio exceeds this value, the
+    # face is considered near-profile and the frame is skipped
+    # (passthrough). MuseTalk is trained mostly on front/3-quarter
+    # views and produces poor lipsync output (color blocks,
+    # wrong mouth shape) for near-profile faces; skipping avoids
+    # the artifact. 0 disables. Default 1.3 catches obvious
+    # side profiles while leaving front/3-quarter views alone.
+    prefilter_side_face_aspect_ratio: float = Field(
+        1.3,
+        ge=0.0,
+        le=5.0,
+        description="Source-face bbox aspect ratio (w/h) above which the face is considered side-profile and the frame is skipped. 0 disables. Default 1.3.",
     )
     # Side-face / fast-turn prefilters (diffusion-only). MuseTalk does
     # not currently implement yaw-based skipping; values are accepted
@@ -3497,6 +3511,7 @@ class MuseTalkApiRuntime:
             targets = []
             matched_source_frames = 0
             prefiltered_blur_frames = 0
+            prefiltered_side_face_frames = 0
             best_scores = []
             previous_bbox = None
             largest_face_mode = bool(
@@ -3554,6 +3569,25 @@ class MuseTalkApiRuntime:
                         bbox = None
                         score = 0.0
                         prefiltered_blur_frames += 1
+                # Side-face prefilter via bbox aspect ratio. A face
+                # turned to profile has a bbox significantly wider
+                # than tall (w/h > 1.3). MuseTalk is trained mostly
+                # on front/3-quarter views and produces poor output
+                # (color blocks, wrong mouth shape) for near-profile
+                # faces. We skip lipsync for these frames and let
+                # the original pass through. 0 disables.
+                if (
+                    bbox is not None
+                    and payload.prefilter_side_face_aspect_ratio > 0.0
+                ):
+                    fx1, fy1, fx2, fy2 = bbox
+                    fw = max(1, fx2 - fx1)
+                    fh = max(1, fy2 - fy1)
+                    aspect = float(fw) / float(fh)
+                    if aspect > payload.prefilter_side_face_aspect_ratio:
+                        bbox = None
+                        score = 0.0
+                        prefiltered_side_face_frames += 1
                 targets.append({"bbox": bbox, "score": score})
                 best_scores.append(score)
                 if bbox is not None:
@@ -3814,6 +3848,7 @@ class MuseTalkApiRuntime:
                 "filtered_small_face_frames": filtered_small_face_frames,
                 "filtered_short_segment_frames": filtered_short_segment_frames,
                 "prefiltered_blur_frames": prefiltered_blur_frames,
+                "prefiltered_side_face_frames": prefiltered_side_face_frames,
                 "smoothed_source_frames": smoothed_source_frames,
                 "matched_or_filled_source_frames": (
                     matched_source_frames + filled_source_frames + continuity_filled_source_frames
@@ -3926,7 +3961,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         "[LipSync-report] job_id=%s\n"
         "  source: src_frames=%d out_frames=%d src_fps=%.3f audio_fps=%.3f\n"
         "  identity: source=%s count=%d coverage=%.3f sim=%.3f backend=%s\n"
-        "  target: matched=%d filled_init=%d continuity_filled=%d smoothed=%d eligible=%d prefiltered_blur=%d\n"
+        "  target: matched=%d filled_init=%d continuity_filled=%d smoothed=%d eligible=%d prefiltered_blur=%d prefiltered_side=%d\n"
         "  filtered: motion=%d fast_motion=%d mouth_diff=%d small_face=%d short_segment=%d\n"
         "  generated: gen=%d quality_fallback=%d passthrough=%d blend_error=%d\n"
         "  identity_sim: min/med/max=%.3f/%.3f/%.3f\n"
@@ -3948,6 +3983,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         int(result.get("smoothed_source_frames", 0)),
         int(result.get("eligible_source_frames", 0)),
         int(result.get("prefiltered_blur_frames", 0)),
+        int(result.get("prefiltered_side_face_frames", 0)),
         int(result.get("filtered_motion_frames", 0)),
         int(result.get("filtered_fast_motion_frames", 0)),
         int(result.get("filtered_mouth_diff_frames", 0)),
