@@ -304,6 +304,23 @@ class LipSyncRequest(BaseModel):
         le=2000.0,
         description="Mouth-region Laplacian floor. 0 disables. Frame falls back to source if the generated mouth ROI variance is below this.",
     )
+    # Drift fallback. Compares the post-processed face crop to
+    # the reference, excluding the deep mouth ROI (y 55-80%, x
+    # 30-70%). The "non-mouth" region covers the upper face, the
+    # lip-border band right around the lips, the jaw and the
+    # chin. When the mean squared error exceeds this threshold,
+    # the frame falls back to the source (no lip-sync paste).
+    # Catches post-processing over-shifts that produce a visible
+    # color band around the lips, or generations that drifted to
+    # the wrong identity. 0 disables. Default 1000 catches
+    # severe drift; tighten to 200-500 to also catch moderate
+    # color shifts.
+    quality_max_face_outside_mouth_mse: float = Field(
+        1000.0,
+        ge=0.0,
+        le=10000.0,
+        description="Face-crop MSE ceiling outside the mouth ROI. 0 disables. Frame falls back to source when the post-processed face outside the deep mouth differs from the reference by more than this.",
+    )
     # Source-face motion-blur prefilter. Catches frames where the
     # detected face is too blurry (camera motion, fast head turn)
     # to produce useful lip-sync output. When the face-crop
@@ -2749,17 +2766,70 @@ class MuseTalkApiRuntime:
         if image.shape != reference.shape:
             return image
 
-        reference_float = reference.astype(np.float32)
+        height = image.shape[0]
+        cutoff = int(height * 0.55)
+        if cutoff <= 1 or cutoff >= height - 1:
+            return image
+        # Apply detail restore to the upper face only. The mouth
+        # area has its own generated detail; layering the
+        # reference's high-frequency content (which may include a
+        # color cast from the source lighting) onto the mouth
+        # tints the lips toward the reference and produces a
+        # visible color band in the lip area.
+        image_upper = image[:cutoff, :, :]
+        reference_upper = reference[:cutoff, :, :]
+        reference_float = reference_upper.astype(np.float32)
         reference_blur = cv2.GaussianBlur(reference_float, (0, 0), 1.0)
         detail = reference_float - reference_blur
-        restored = image.astype(np.float32) + detail * strength
-        return np.clip(restored, 0, 255).astype(np.uint8)
+        restored = image_upper.astype(np.float32) + detail * strength
+        blended_upper = np.clip(restored, 0, 255).astype(np.uint8)
+        result = image.copy()
+        result[:cutoff, :, :] = blended_upper
+        return result
 
     def _laplacian_variance(self, image: np.ndarray) -> float:
         if image.size == 0:
             return 0.0
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    @staticmethod
+    def _face_outside_mouth_mse(generated: np.ndarray, reference: np.ndarray) -> float:
+        """Mean squared error on the face crop, **excluding** the
+        deep mouth ROI (y 55-80%, x 30-70%). The "non-mouth"
+        region covers the upper face, the lip-border band right
+        around the lips, the jaw, and the chin. A large MSE here
+        means post-processing or the generation has drifted from
+        the source in the area the user can actually see around
+        the lips -- a reliable signal of a bad frame even when
+        the deep mouth area itself looks plausible.
+        """
+        if (
+            generated is None
+            or reference is None
+            or generated.size == 0
+            or reference.size == 0
+        ):
+            return 0.0
+        if generated.shape != reference.shape:
+            return 0.0
+        h, w = generated.shape[:2]
+        y0 = int(h * 0.55)
+        y1 = int(h * 0.80)
+        x0 = int(w * 0.30)
+        x1 = int(w * 0.70)
+        gen = generated.astype(np.float32)
+        ref = reference.astype(np.float32)
+        # 0 inside the mouth ROI, 1 outside
+        mask = np.ones((h, w), dtype=np.float32)
+        if 0 < y0 < h and 0 < x0 < w and y0 < y1 and x0 < x1:
+            mask[y0:y1, x0:x1] = 0.0
+        weight = mask.sum()
+        if weight < 1.0:
+            return 0.0
+        diff_sq = (gen - ref) ** 2
+        mse_per_pixel = diff_sq.mean(axis=2)
+        return float((mse_per_pixel * mask).sum() / weight)
 
     @staticmethod
     def _mouth_region_laplacian(face_crop: np.ndarray) -> float:
@@ -2818,6 +2888,7 @@ class MuseTalkApiRuntime:
         quality_min_laplacian: float,
         quality_min_sharpness_ratio: float,
         quality_mouth_min_laplacian: float,
+        quality_max_face_outside_mouth_mse: float,
         face_parser: Optional[FaceParsing],
     ) -> List[str]:
         """Write every output frame to ``output_dir`` and return a
@@ -2890,6 +2961,24 @@ class MuseTalkApiRuntime:
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
                 resized = self._restore_reference_detail(resized, reference_crop, mouth_detail_strength)
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
+                # Drift fallback. Compares the post-processed face
+                # crop to the reference on the area OUTSIDE the
+                # deep mouth ROI (upper face + lip border + jaw).
+                # When the MSE exceeds the threshold, the
+                # post-processing or the generation has drifted
+                # from the source in a way that would produce a
+                # visible color/seam around the lips -- fall back
+                # to the source frame so the user sees the
+                # unmodified original instead of a half-broken
+                # edit.
+                if (
+                    quality_max_face_outside_mouth_mse > 0.0
+                    and self._face_outside_mouth_mse(resized, reference_crop)
+                    > quality_max_face_outside_mouth_mse
+                ):
+                    blend_status = "quality_fallback"
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
                 # Mouth-region postfilter. Catches a single large
                 # blurry patch in the generated mouth (CodeFormer
                 # failure, VAE collapse) that the whole-image
@@ -3499,6 +3588,7 @@ class MuseTalkApiRuntime:
                 payload.quality_min_laplacian,
                 payload.quality_min_sharpness_ratio,
                 payload.quality_mouth_min_laplacian,
+                payload.quality_max_face_outside_mouth_mse,
                 face_parser,
             )
             quality_fallback_frames = sum(
