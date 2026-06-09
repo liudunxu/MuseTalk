@@ -676,6 +676,15 @@ def _download_to_file(url: str, dest_dir: Path, prefix: str, allowed: set, fallb
                     if downloaded > settings.max_download_bytes:
                         raise HTTPException(status_code=413, detail=f"{prefix} is larger than API_MAX_DOWNLOAD_BYTES")
                     file_obj.write(chunk)
+            if downloaded == 0:
+                # Server returned 2xx but no bytes -- treat as retryable
+                # so a transient CDN/TCP glitch gets a second chance
+                # instead of silently producing a 0-byte input file.
+                raise _RetryableDownloadError("Downloaded 0 bytes")
+            logger.info(
+                "[Download] %s -> %s (%d bytes)",
+                prefix, output_path, downloaded,
+            )
             temp_path.replace(output_path)
             return output_path
         except HTTPException:
@@ -710,9 +719,22 @@ def _download_to_file(url: str, dest_dir: Path, prefix: str, allowed: set, fallb
 
 
 def _read_video_frames(video_path: Path) -> Tuple[List[np.ndarray], float]:
+    if not video_path.exists():
+        raise RuntimeError(f"Video file does not exist: {video_path}")
+    file_size = video_path.stat().st_size
+    if file_size == 0:
+        raise RuntimeError(
+            f"Video file is empty (0 bytes): {video_path} -- "
+            "the upstream download likely failed silently; check the URL and API_MAX_DOWNLOAD_BYTES."
+        )
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
+        raise RuntimeError(
+            f"Could not open video with OpenCV: {video_path} "
+            f"(size={file_size} bytes) -- the file is likely truncated, "
+            "or its codec/container is not supported by this OpenCV build "
+            "(check ffmpeg linkage and the file with `ffprobe` / `file`)."
+        )
 
     fps = cap.get(cv2.CAP_PROP_FPS)
     if not fps or math.isnan(fps) or fps <= 1:
@@ -727,7 +749,10 @@ def _read_video_frames(video_path: Path) -> Tuple[List[np.ndarray], float]:
     cap.release()
 
     if not frames:
-        raise RuntimeError(f"No frames were decoded from video: {video_path}")
+        raise RuntimeError(
+            f"No frames were decoded from video: {video_path} "
+            f"(size={file_size} bytes) -- file is likely truncated or uses an unsupported codec."
+        )
     return frames, fps
 
 
