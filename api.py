@@ -312,30 +312,30 @@ class LipSyncRequest(BaseModel):
     # the frame falls back to the source (no lip-sync paste).
     # Catches post-processing over-shifts that produce a visible
     # color band around the lips, or generations that drifted to
-    # the wrong identity. 0 disables. Default 700 sits above
-    # natural face/crop variation while still catching major
-    # color shifts; lower to 300 for stricter, raise to 1500+
-    # to essentially disable without setting 0.
+    # the wrong identity. 0 disables (default). MSE is a coarse
+    # metric that cannot reliably distinguish a MuseTalk color
+    # block from legitimate lip-motion variation, so the
+    # default is OFF and clients opt in by setting a value.
+    # 500-1000 catches obvious drift; 100-300 is strict and
+    # will start catching clean generations.
     quality_max_face_outside_mouth_mse: float = Field(
-        700.0,
+        0.0,
         ge=0.0,
         le=10000.0,
-        description="Face-crop MSE ceiling outside the mouth ROI. 0 disables. Frame falls back to source when the post-processed face outside the deep mouth differs from the reference by more than this.",
+        description="Face-crop MSE ceiling outside the mouth ROI. 0 (default) disables.",
     )
     # Localized color-block fallback. Divides the face crop into
     # tiles (default 32x32) and computes per-tile MSE vs the
     # reference. If any single tile exceeds this threshold, the
-    # frame falls back to source. This catches LOCAL color blocks
-    # that the mean-MSE drift check misses (mean is diluted by
-    # the rest of the face being clean, max is not). 0 disables.
-    # Default 1000 tolerates natural local detail (teeth, hair)
-    # while still catching a single-tile color block. Lower to
-    # 500 for stricter, raise to 2000+ to essentially disable.
+    # frame falls back to source. 0 disables (default). Same
+    # coarse-metric caveat as the mean-MSE drift check above:
+    # opt in only if the soft-transition fixes do not eliminate
+    # the color bands on their own.
     quality_max_face_tile_mse: float = Field(
-        1000.0,
+        0.0,
         ge=0.0,
         le=10000.0,
-        description="Per-tile MSE ceiling on the face crop. 0 disables. Frame falls back to source if any tile differs from the reference by more than this.",
+        description="Per-tile MSE ceiling on the face crop. 0 (default) disables.",
     )
     # Source-face motion-blur prefilter. Catches frames where the
     # detected face is too blurry (camera motion, fast head turn)
@@ -2736,13 +2736,13 @@ class MuseTalkApiRuntime:
 
         image_float = image.astype(np.float32)
         reference_float = reference.astype(np.float32)
-        # Compute color stats on the upper face only (y < 55%) so the
-        # mouth area (y 55-100%) doesn't pull the stats toward lip/
-        # teeth colors. Apply the color transfer ONLY to the upper
-        # face -- the mouth is left untouched and keeps its
-        # generated colors. Applying the transfer to the whole crop
-        # shifts the mouth's color toward the upper-face reference
-        # and produces a visible color band in the lip area.
+        # Compute color stats on the upper face only (y < 55%) so
+        # the mouth area (y 55-100%) doesn't pull the stats toward
+        # lip/teeth colors. Apply the color transfer with a SOFT
+        # mask (1.0 at y < 40%, ramping to 0 at y > 60%) so there
+        # is no hard seam at the upper/lower boundary. The mouth
+        # area keeps its generated colors; the transition into the
+        # upper face is smooth.
         height = image_float.shape[0]
         cutoff = int(height * 0.55)
         if cutoff <= 1 or cutoff >= height - 1:
@@ -2755,14 +2755,20 @@ class MuseTalkApiRuntime:
         image_std = image_std.reshape(1, 1, 3)
         reference_mean = reference_mean.reshape(1, 1, 3)
         reference_std = reference_std.reshape(1, 1, 3)
-        matched_upper = (
-            (image_upper - image_mean)
+        # Whole-image per-channel transfer.
+        matched = (
+            (image_float - image_mean)
             * (reference_std / np.maximum(image_std, 1.0))
             + reference_mean
         )
-        blended_upper = image_upper * (1.0 - strength) + matched_upper * strength
-        image_float[:cutoff, :, :] = blended_upper
-        return np.clip(image_float, 0, 255).astype(np.uint8)
+        blended = image_float * (1.0 - strength) + matched * strength
+        soft_mask = self._soft_upper_mask(height)
+        # Where soft_mask is 1 -> use color-matched; where 0 -> keep
+        # raw generated. Smooth transition between 40% and 60% of
+        # face height avoids the visible color band a hard cutoff
+        # would produce.
+        result = image_float * (1.0 - soft_mask) + blended * soft_mask
+        return np.clip(result, 0, 255).astype(np.uint8)
 
     def _sharpen_image(self, image: np.ndarray, strength: float) -> np.ndarray:
         if strength <= 0.0 or image.size == 0:
@@ -2786,28 +2792,53 @@ class MuseTalkApiRuntime:
         cutoff = int(height * 0.55)
         if cutoff <= 1 or cutoff >= height - 1:
             return image
-        # Apply detail restore to the upper face only. The mouth
-        # area has its own generated detail; layering the
-        # reference's high-frequency content (which may include a
-        # color cast from the source lighting) onto the mouth
-        # tints the lips toward the reference and produces a
-        # visible color band in the lip area.
-        image_upper = image[:cutoff, :, :]
-        reference_upper = reference[:cutoff, :, :]
-        reference_float = reference_upper.astype(np.float32)
+        # Apply detail restore with a soft upper-face mask (1.0 at
+        # y < 40%, ramping to 0 at y > 60%) so the reference's
+        # high-frequency content fades out smoothly before the
+        # mouth area. Avoids the visible color band a hard cutoff
+        # at y = 55% would produce.
+        reference_float = reference.astype(np.float32)
         reference_blur = cv2.GaussianBlur(reference_float, (0, 0), 1.0)
         detail = reference_float - reference_blur
-        restored = image_upper.astype(np.float32) + detail * strength
-        blended_upper = np.clip(restored, 0, 255).astype(np.uint8)
-        result = image.copy()
-        result[:cutoff, :, :] = blended_upper
-        return result
+        restored = image.astype(np.float32) + detail * strength
+        soft_mask = self._soft_upper_mask(height)
+        result = image.astype(np.float32) * (1.0 - soft_mask) + restored * soft_mask
+        return np.clip(result, 0, 255).astype(np.uint8)
 
     def _laplacian_variance(self, image: np.ndarray) -> float:
         if image.size == 0:
             return 0.0
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+    @staticmethod
+    def _soft_upper_mask(
+        height: int,
+        soft_start_ratio: float = 0.40,
+        soft_end_ratio: float = 0.60,
+    ) -> np.ndarray:
+        """Soft upper-face mask, shape ``(height, 1, 1)``.
+
+        Returns 1.0 above ``soft_start_ratio * height``, linear
+        ramp down to 0 at ``soft_end_ratio * height``, 0 below.
+        Used to apply upper-face post-processing (color match /
+        detail restore / sharpen) without a hard seam at the
+        upper/lower boundary.
+        """
+        mask = np.ones((height, 1, 1), dtype=np.float32)
+        soft_start = int(height * soft_start_ratio)
+        soft_end = int(height * soft_end_ratio)
+        if soft_start < 0:
+            soft_start = 0
+        if soft_end > height:
+            soft_end = height
+        if soft_end > soft_start:
+            ramp = np.linspace(1.0, 0.0, soft_end - soft_start, dtype=np.float32)
+            mask[soft_start:soft_end, 0, 0] = ramp
+            mask[soft_end:, 0, 0] = 0.0
+        elif soft_start >= height:
+            mask[:] = 0.0
+        return mask
 
     @staticmethod
     def _face_max_tile_mse(
