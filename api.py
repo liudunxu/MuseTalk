@@ -258,10 +258,10 @@ class LipSyncRequest(BaseModel):
     extra_margin: int = Field(10, ge=0, le=100)
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
-    blend_mask_blur_ratio: float = Field(0.04, ge=0.0, le=0.2)
+    blend_mask_blur_ratio: float = Field(0.025, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
-    mouth_detail_strength: float = Field(0.75, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.10, ge=0.0, le=1.0)
+    mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.20, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default.
@@ -375,13 +375,14 @@ class LipSyncRequest(BaseModel):
         description="Run CodeFormer face restoration on the aligned face crops before paste-back.",
     )
     codeformer_fidelity_weight: float = Field(
-        0.7,
+        0.5,
         ge=0.0,
         le=1.0,
         description="CodeFormer fidelity weight. 0 = sharpest (most codebook-driven, identity drift), "
-                    "1 = closest to input. Default 0.7 is tuned for lip-sync output: the upstream "
-                    "0.5 over-reconstructs the inpainter's output and tends to overwrite the "
-                    "lipsync with a 'more typical' face. 0.85+ is safest for identity preservation.",
+                    "1 = closest to input. Default 0.5 is tuned for lip-sync output where the "
+                    "generated mouth is the priority: the lower value lets CodeFormer add visible "
+                    "high-frequency detail to the lips and teeth. Raise to 0.7-0.85 to better "
+                    "preserve the inpainter's lipsync against the codebook's 'typical' face.",
     )
     codeformer_adain: bool = Field(
         True,
