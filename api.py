@@ -393,6 +393,23 @@ class LipSyncRequest(BaseModel):
         le=5.0,
         description="Source-face bbox aspect ratio (w/h) above which the face is considered side-profile and the frame is skipped. 0 disables. Default 1.3.",
     )
+    # Cross-frame face lock (no-avatar path). When > 0, the per-
+    # frame mouth-openness picker filters candidates to those
+    # whose bbox has IoU >= this value against the previous
+    # frame's accepted bbox. Prevents the lipsync target from
+    # switching to a different person when the camera pans
+    # between two faces (the "face switching" artifact). When no
+    # candidate has enough IoU, the picker falls back to the
+    # most-open-mouth face. 0 disables (free picking each
+    # frame). Default 0.1 is loose enough to tolerate normal
+    # bbox jitter; raise to 0.3 for stricter lock, lower to 0.05
+    # for very loose.
+    target_track_min_iou: float = Field(
+        0.1,
+        ge=0.0,
+        le=1.0,
+        description="Cross-frame face lock IoU floor (no-avatar path). 0 disables. Default 0.1 = loose lock to prevent target switching.",
+    )
     # Side-face / fast-turn prefilters (diffusion-only). MuseTalk does
     # not currently implement yaw-based skipping; values are accepted
     # for API compatibility and logged when non-default.
@@ -1885,12 +1902,24 @@ class MuseTalkApiRuntime:
         require_landmark_match: bool,
         min_landmark_points: int,
         min_landmark_overlap: float,
+        previous_bbox: Optional[Tuple[int, int, int, int]] = None,
+        track_min_iou: float = 0.0,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         """Pick the face whose mouth is most open in the current
         frame. Used by the no-avatar fast path where cross-frame
         identity matching is skipped -- when several people are in
         the frame, the actively speaking one usually has the most
         open mouth, which is what we want to drive lip-sync on.
+
+        When ``previous_bbox`` is provided AND ``track_min_iou >
+        0``, the picker locks onto the same face across frames by
+        filtering candidates to those with IoU >= ``track_min_iou``
+        against the previous bbox. This prevents the lipsync
+        target from switching to a different person when the
+        camera pans or another face becomes briefly the largest
+        in frame (the "face switching" artifact). When no
+        candidate has enough IoU, the picker falls back to the
+        most-open-mouth face (treats the tracked face as lost).
 
         Returns ``(bbox, detection_score)`` or ``(None, 0.0)`` if
         no face passes the basic size/detection filters.
@@ -1916,6 +1945,10 @@ class MuseTalkApiRuntime:
                 min_landmark_overlap,
             ):
                 continue
+            if previous_bbox is not None and track_min_iou > 0.0:
+                iou = _box_iou(previous_bbox, bbox)
+                if iou < track_min_iou:
+                    continue
             x1, y1, x2, y2 = bbox
             face_crop = frame[
                 max(0, y1):min(frame.shape[0], y2),
@@ -3545,6 +3578,8 @@ class MuseTalkApiRuntime:
                         payload.require_landmark_match,
                         payload.min_landmark_points,
                         payload.min_landmark_overlap,
+                        previous_bbox=previous_bbox,
+                        track_min_iou=payload.target_track_min_iou,
                     )
                 else:
                     bbox, score = None, 0.0
