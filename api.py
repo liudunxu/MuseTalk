@@ -312,11 +312,12 @@ class LipSyncRequest(BaseModel):
     # the frame falls back to the source (no lip-sync paste).
     # Catches post-processing over-shifts that produce a visible
     # color band around the lips, or generations that drifted to
-    # the wrong identity. 0 disables. Default 300 catches
-    # moderate color shifts; raise to 500-1000 if too many
-    # false-positive fallbacks on clean generations.
+    # the wrong identity. 0 disables. Default 700 sits above
+    # natural face/crop variation while still catching major
+    # color shifts; lower to 300 for stricter, raise to 1500+
+    # to essentially disable without setting 0.
     quality_max_face_outside_mouth_mse: float = Field(
-        300.0,
+        700.0,
         ge=0.0,
         le=10000.0,
         description="Face-crop MSE ceiling outside the mouth ROI. 0 disables. Frame falls back to source when the post-processed face outside the deep mouth differs from the reference by more than this.",
@@ -327,12 +328,11 @@ class LipSyncRequest(BaseModel):
     # frame falls back to source. This catches LOCAL color blocks
     # that the mean-MSE drift check misses (mean is diluted by
     # the rest of the face being clean, max is not). 0 disables.
-    # Default 500 catches a half-face color shift in one tile;
-    # tighten to 200-300 for stricter detection, raise to 1000+
-    # if false positives on legitimate content with high
-    # local detail (e.g., open mouth with teeth, hair).
+    # Default 1000 tolerates natural local detail (teeth, hair)
+    # while still catching a single-tile color block. Lower to
+    # 500 for stricter, raise to 2000+ to essentially disable.
     quality_max_face_tile_mse: float = Field(
-        500.0,
+        1000.0,
         ge=0.0,
         le=10000.0,
         description="Per-tile MSE ceiling on the face crop. 0 disables. Frame falls back to source if any tile differs from the reference by more than this.",
