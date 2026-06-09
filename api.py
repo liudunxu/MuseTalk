@@ -298,11 +298,22 @@ class LipSyncRequest(BaseModel):
     # falls back to the source. 0 disables. Reasonable values
     # for 256x256 face crops sit in the 1.0-5.0 range; tune
     # upward if too many false-positive fallbacks.
+    # Mouth-region sharpness floor. Catches a single large
+    # BLURRY patch in the generated mouth (CodeFormer failure,
+    # VAE collapse, model color block) where the color is
+    # similar to the surrounding face but the local sharpness
+    # has dropped. Complements the color histogram check above
+    # which only catches color shifts, not blurriness. 0
+    # disables. Default 5.0 = light check: tolerates normal
+    # lip-motion variance (50-200) while catching a blurred
+    # patch (0.5-5). Raise to 10-20 to only catch the most
+    # severe cases, lower to 1-2 to also catch moderate
+    # blurriness.
     quality_mouth_min_laplacian: float = Field(
-        0.0,
+        5.0,
         ge=0.0,
         le=2000.0,
-        description="Mouth-region Laplacian floor. 0 disables. Frame falls back to source if the generated mouth ROI variance is below this.",
+        description="Mouth-region Laplacian floor. 0 disables. Default 5.0 = light check that catches a blurred patch while tolerating normal lip motion.",
     )
     # Light color-block check. Compares the COLOR DISTRIBUTION
     # (per-channel histogram) of the upper face (y < 55%) between
