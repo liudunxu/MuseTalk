@@ -304,6 +304,24 @@ class LipSyncRequest(BaseModel):
         le=2000.0,
         description="Mouth-region Laplacian floor. 0 disables. Frame falls back to source if the generated mouth ROI variance is below this.",
     )
+    # Light color-block check. Compares the COLOR DISTRIBUTION
+    # (per-channel histogram) of the upper face (y < 55%) between
+    # the post-processed crop and the reference. Returns the sum
+    # of per-channel CHISQR distances (0 = identical, higher =
+    # more different). Unlike the MSE checks above, this metric
+    # is more about "did the color shift significantly" than
+    # "did any single pixel change" -- so it tolerates normal
+    # per-pixel variation from lip motion and only fires on a
+    # hard color block. 0 disables. Default 0.5 is a LIGHT
+    # check (catches obvious color blocks, passes clean
+    # lipsync). Lower to 0.2 for stricter, raise to 1.0+ for
+    # more permissive.
+    quality_max_face_color_histogram_distance: float = Field(
+        0.5,
+        ge=0.0,
+        le=10.0,
+        description="Upper-face color histogram CHISQR distance ceiling. 0 disables. Default 0.5 = light check.",
+    )
     # Drift fallback. Compares the post-processed face crop to
     # the reference, excluding the deep mouth ROI (y 55-80%, x
     # 30-70%). The "non-mouth" region covers the upper face, the
@@ -2841,6 +2859,53 @@ class MuseTalkApiRuntime:
         return mask
 
     @staticmethod
+    def _face_color_histogram_distance(
+        generated: np.ndarray,
+        reference: np.ndarray,
+        bins: int = 32,
+    ) -> float:
+        """Sum of per-channel CHISQR histogram distances on the
+        upper face (y < 55%, outside the mouth ROI).
+
+        Unlike MSE, this metric compares the COLOR DISTRIBUTION
+        rather than per-pixel values. Normal lip motion shifts
+        the per-pixel content of the mouth but barely changes
+        the upper-face color distribution; a hard color block
+        in the upper face, on the other hand, does shift the
+        distribution noticeably. Returns 0.0 when histograms
+        are identical; higher = more different.
+        """
+        if (
+            generated is None
+            or reference is None
+            or generated.size == 0
+            or reference.size == 0
+        ):
+            return 0.0
+        if generated.shape != reference.shape:
+            return 0.0
+        h = generated.shape[0]
+        cutoff = int(h * 0.55)
+        if cutoff <= 1:
+            return 0.0
+        gen_upper = generated[:cutoff, :, :]
+        ref_upper = reference[:cutoff, :, :]
+        total = 0.0
+        for channel in range(3):
+            gen_hist = cv2.calcHist(
+                [gen_upper], [channel], None, [bins], [0, 256]
+            )
+            ref_hist = cv2.calcHist(
+                [ref_upper], [channel], None, [bins], [0, 256]
+            )
+            cv2.normalize(gen_hist, gen_hist)
+            cv2.normalize(ref_hist, ref_hist)
+            total += float(
+                cv2.compareHist(gen_hist, ref_hist, cv2.HISTCMP_CHISQR)
+            )
+        return total
+
+    @staticmethod
     def _face_max_tile_mse(
         generated: np.ndarray,
         reference: np.ndarray,
@@ -2975,6 +3040,7 @@ class MuseTalkApiRuntime:
         quality_mouth_min_laplacian: float,
         quality_max_face_outside_mouth_mse: float,
         quality_max_face_tile_mse: float,
+        quality_max_face_color_histogram_distance: float,
         face_parser: Optional[FaceParsing],
     ) -> List[str]:
         """Write every output frame to ``output_dir`` and return a
@@ -3047,6 +3113,24 @@ class MuseTalkApiRuntime:
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
                 resized = self._restore_reference_detail(resized, reference_crop, mouth_detail_strength)
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
+                # Light color-block check. Compares the upper-face
+                # color distribution between the post-processed
+                # crop and the reference. Tolerates normal per-
+                # pixel variation (lip motion) and only fires on a
+                # hard color block. Runs first because it is the
+                # most semantically appropriate for color blocks;
+                # the heavier MSE checks below are opt-in for
+                # stricter behavior.
+                if (
+                    quality_max_face_color_histogram_distance > 0.0
+                    and self._face_color_histogram_distance(
+                        resized, reference_crop
+                    )
+                    > quality_max_face_color_histogram_distance
+                ):
+                    blend_status = "quality_fallback"
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
                 # Drift fallback. Compares the post-processed face
                 # crop to the reference on the area OUTSIDE the
                 # deep mouth ROI (upper face + lip border + jaw).
@@ -3684,6 +3768,7 @@ class MuseTalkApiRuntime:
                 payload.quality_mouth_min_laplacian,
                 payload.quality_max_face_outside_mouth_mse,
                 payload.quality_max_face_tile_mse,
+                payload.quality_max_face_color_histogram_distance,
                 face_parser,
             )
             quality_fallback_frames = sum(
