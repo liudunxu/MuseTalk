@@ -506,9 +506,11 @@ def _describe_target_identity_source(
       - "avatar_fallback:<most_frequent_face|first_largest_face>":
         avatar was provided but no cluster cleared the similarity
         threshold, so we fell back to the no-avatar heuristic.
-      - "largest_face_per_frame": no avatar provided; per-frame
-        loop picks the largest face in each frame directly,
-        without cross-frame identity matching.
+      - "largest_face_per_frame": kept for backward compatibility;
+        older runs may still report this string.
+      - "most_open_mouth_per_frame": no avatar provided; per-frame
+        loop picks the face with the most open mouth in each
+        frame, without cross-frame identity matching.
       - "<most_frequent_face|first_largest_face>": no avatar
         provided; heuristic pick from the source video (legacy
         no-avatar path; not used by the default flow anymore).
@@ -517,6 +519,8 @@ def _describe_target_identity_source(
     if target_identity is None:
         return "none"
     selection_source = target_identity.get("selection_source")
+    if selection_source == "most_open_mouth_per_frame":
+        return "most_open_mouth_per_frame"
     if selection_source == "largest_face_per_frame":
         return "largest_face_per_frame"
     if avatar_descriptor is not None and selection_source in (
@@ -1717,7 +1721,35 @@ class MuseTalkApiRuntime:
         target_bbox = self._landmark_bbox_for_face(landmarks, best_bbox, bbox_shift, frame.shape)
         return target_bbox, best_score
 
-    def _select_largest_face_bbox(
+    @staticmethod
+    def _mouth_openness_score(face_crop: np.ndarray) -> float:
+        """Estimate mouth openness from a face crop (BGR uint8).
+
+        Crops the mouth region (y 55-80%, x 30-70% of the face)
+        and returns the standard deviation of grayscale intensity.
+        Open mouth has more variation (lips + teeth + cavity) so
+        the std is higher; a closed mouth is uniform skin tone and
+        the std is low. Higher score = more open.
+
+        Returns 0.0 on empty/invalid crops. The score is a
+        within-frame relative ranking, not an absolute openness
+        measurement, so cross-frame lighting changes are not an
+        issue.
+        """
+        if face_crop is None or face_crop.size == 0:
+            return 0.0
+        h, w = face_crop.shape[:2]
+        y0, y1 = int(h * 0.55), int(h * 0.80)
+        x0, x1 = int(w * 0.30), int(w * 0.70)
+        if y1 <= y0 or x1 <= x0:
+            return 0.0
+        mouth = face_crop[y0:y1, x0:x1]
+        if mouth.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(mouth, cv2.COLOR_BGR2GRAY)
+        return float(np.std(gray))
+
+    def _select_most_open_mouth_bbox(
         self,
         frame: np.ndarray,
         bbox_shift: int,
@@ -1726,10 +1758,11 @@ class MuseTalkApiRuntime:
         min_landmark_points: int,
         min_landmark_overlap: float,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
-        """Pick the largest face in the current frame, ignoring
-        identity. Used by the no-avatar fast path where cross-frame
-        identity matching is skipped -- the largest face in a frame
-        is almost always the main subject.
+        """Pick the face whose mouth is most open in the current
+        frame. Used by the no-avatar fast path where cross-frame
+        identity matching is skipped -- when several people are in
+        the frame, the actively speaking one usually has the most
+        open mouth, which is what we want to drive lip-sync on.
 
         Returns ``(bbox, detection_score)`` or ``(None, 0.0)`` if
         no face passes the basic size/detection filters.
@@ -1738,31 +1771,37 @@ class MuseTalkApiRuntime:
         if not face_boxes:
             return None, 0.0
 
+        landmarks = self._pose_face_landmarks(frame) if require_landmark_match else []
+
         best_bbox = None
-        best_area = 0
-        best_score = 0.0
+        best_openness = -1.0
+        best_detection_score = 0.0
         for bbox, detection_score in face_boxes:
             if not self._passes_face_filters(
                 frame,
                 bbox,
                 detection_score,
                 min_detection_score,
-                [],
-                False,
+                landmarks,
+                require_landmark_match,
                 min_landmark_points,
                 min_landmark_overlap,
             ):
                 continue
-            area = _box_area(bbox)
-            if area > best_area:
-                best_area = area
+            x1, y1, x2, y2 = bbox
+            face_crop = frame[
+                max(0, y1):min(frame.shape[0], y2),
+                max(0, x1):min(frame.shape[1], x2),
+            ]
+            openness = self._mouth_openness_score(face_crop)
+            if openness > best_openness:
+                best_openness = openness
                 best_bbox = bbox
-                best_score = float(detection_score)
+                best_detection_score = float(detection_score)
 
         if best_bbox is None:
             return None, 0.0
 
-        landmarks = self._pose_face_landmarks(frame) if require_landmark_match else []
         if require_landmark_match and not self._face_box_matches_landmarks(
             landmarks,
             best_bbox,
@@ -1772,7 +1811,7 @@ class MuseTalkApiRuntime:
         ):
             landmarks = []
         target_bbox = self._landmark_bbox_for_face(landmarks, best_bbox, bbox_shift, frame.shape)
-        return target_bbox, best_score
+        return target_bbox, best_detection_score
 
     def _find_target_identity(
         self,
@@ -1790,7 +1829,7 @@ class MuseTalkApiRuntime:
             # target identity -- the largest face in a frame is
             # almost always the main subject.
             return {
-                "selection_source": "largest_face_per_frame",
+                "selection_source": "most_open_mouth_per_frame",
                 "avatar_score": 0.0,
                 "count": 0,
                 "identity_coverage": 0.0,
@@ -3090,7 +3129,7 @@ class MuseTalkApiRuntime:
             best_scores = []
             previous_bbox = None
             largest_face_mode = bool(
-                target_identity and target_identity.get("selection_source") == "largest_face_per_frame"
+                target_identity and target_identity.get("selection_source") == "most_open_mouth_per_frame"
             )
             for frame in _progress(frames, "match target", total=len(frames), unit="frame"):
                 if target_descriptors:
@@ -3113,7 +3152,7 @@ class MuseTalkApiRuntime:
                         temporal_tracking_weight=payload.temporal_tracking_weight,
                     )
                 elif largest_face_mode:
-                    bbox, score = self._select_largest_face_bbox(
+                    bbox, score = self._select_most_open_mouth_bbox(
                         frame,
                         payload.bbox_shift,
                         payload.min_detection_score,
