@@ -3335,7 +3335,12 @@ runtime = MuseTalkApiRuntime()
 
 def _output_url(request: Request, output_path: Path) -> str:
     relative = output_path.relative_to(OUTPUT_ROOT).as_posix()
-    return f"{str(request.base_url).rstrip('/')}/outputs/{relative}"
+    # Force https and take host:port from the actual request. When the
+    # service sits behind a TLS-terminating reverse proxy (e.g.
+    # seetacloud), ``request.url.netloc`` reflects whatever the proxy
+    # forwarded -- if the proxy is on the standard 443, netloc has no
+    # port; if a non-default port is forwarded it is preserved.
+    return f"https://{request.url.netloc}/outputs/{relative}"
 
 
 def _local_output_from_url(url: str) -> Optional[Path]:
@@ -3464,7 +3469,7 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
     else:
         output_path = result.pop("output_path")
         video_url = _output_url(request, output_path)
-    download_url = f"{str(request.base_url).rstrip('/')}/api/download?url={quote(video_url, safe='')}"
+    download_url = f"https://{request.url.netloc}/api/download?url={quote(video_url, safe='')}"
     logger.info(
         "[LipSync] job_id=%s video_url=%s download_url=%s passthrough=%s",
         job_id,
