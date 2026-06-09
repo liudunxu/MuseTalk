@@ -2153,12 +2153,18 @@ class MuseTalkApiRuntime:
                         "mouth_region_diff": diff,
                     }
                     filtered += 1
-                    # Keep the break crop as the next reference instead
-                    # of resetting to None: a sustained face switch
-                    # (next frame also differs) is then caught by the
-                    # same check, avoiding a 1-3 frame blind window
-                    # where a real switch could pass undetected.
-                    prev_crop = crop
+                    # Reset to None: a single large mouth-region
+                    # diff is usually a normal open/close transition
+                    # during speech, not a real face switch. Keeping
+                    # the break crop as the next reference would make
+                    # the *next* frame (mouth returning to neutral)
+                    # also compare high against the open-mouth crop
+                    # and get filtered too -- cascading false
+                    # positives that remove lip-sync from every other
+                    # frame. The 1-3 frame blind window here is
+                    # intentional; bridged segments are recovered by
+                    # the continuity fill (lipsync_continuity_*).
+                    prev_crop = None
                     prev_index = index
                     continue
             prev_crop = crop
