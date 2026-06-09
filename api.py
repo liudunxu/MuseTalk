@@ -261,7 +261,7 @@ class LipSyncRequest(BaseModel):
     blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.40, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default.
@@ -409,6 +409,20 @@ class LipSyncRequest(BaseModel):
         ge=0.0,
         le=1.0,
         description="Cross-frame face lock IoU floor (no-avatar path). 0 disables. Default 0.1 = loose lock to prevent target switching.",
+    )
+    # Output-level temporal blend. After all post-processing,
+    # mixes the current face crop with the previous frame's face
+    # crop. Cures the per-frame content jitter that bbox
+    # smoothing alone cannot fix: the bbox position is stable,
+    # but the generated mouth shape / texture still shakes
+    # between frames. 0 disables (current per-frame behavior).
+    # Per-request 0.2-0.3 is a light smooth, 0.4-0.5 is heavy
+    # and may ghost on fast motion.
+    output_temporal_blend: float = Field(
+        0.0,
+        ge=0.0,
+        le=0.9,
+        description="Output-level temporal blend with the previous frame. 0 disables.",
     )
     # Side-face / fast-turn prefilters (diffusion-only). MuseTalk does
     # not currently implement yaw-based skipping; values are accepted
@@ -3092,6 +3106,7 @@ class MuseTalkApiRuntime:
         color_match_strength: float,
         mouth_detail_strength: float,
         mouth_sharpen_strength: float,
+        output_temporal_blend: float,
         quality_gate_enabled: bool,
         quality_min_laplacian: float,
         quality_min_sharpness_ratio: float,
@@ -3121,6 +3136,7 @@ class MuseTalkApiRuntime:
         frame_count = len(frames)
         provenance: List[str] = ["passthrough"] * output_frame_count
         blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
+        previous_resized: Optional[np.ndarray] = None
         for output_index in _progress(
             range(output_frame_count),
             "render frames",
@@ -3171,6 +3187,29 @@ class MuseTalkApiRuntime:
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
                 resized = self._restore_reference_detail(resized, reference_crop, mouth_detail_strength)
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
+                # Output-level temporal blend. After all post-
+                # processing, mix the current face crop with the
+                # previous frame's face crop. Cures the per-frame
+                # content jitter that bbox smoothing alone cannot
+                # fix (bbox position is stable, but the generated
+                # mouth shape / texture still shakes between
+                # frames). 0 disables. Default 0 = current per-
+                # frame behavior; per-request 0.2-0.3 is a light
+                # smooth, 0.4-0.5 is heavy and may ghost on fast
+                # motion.
+                if (
+                    output_temporal_blend > 0.0
+                    and previous_resized is not None
+                    and previous_resized.shape == resized.shape
+                ):
+                    resized = cv2.addWeighted(
+                        resized,
+                        1.0 - output_temporal_blend,
+                        previous_resized,
+                        output_temporal_blend,
+                        0,
+                    )
+                previous_resized = resized
                 # Light color-block check. Compares the upper-face
                 # color distribution between the post-processed
                 # crop and the reference. Tolerates normal per-
@@ -3842,6 +3881,7 @@ class MuseTalkApiRuntime:
                 payload.color_match_strength,
                 payload.mouth_detail_strength,
                 payload.mouth_sharpen_strength,
+                payload.output_temporal_blend,
                 payload.quality_gate_enabled,
                 payload.quality_min_laplacian,
                 payload.quality_min_sharpness_ratio,
