@@ -312,14 +312,30 @@ class LipSyncRequest(BaseModel):
     # the frame falls back to the source (no lip-sync paste).
     # Catches post-processing over-shifts that produce a visible
     # color band around the lips, or generations that drifted to
-    # the wrong identity. 0 disables. Default 1000 catches
-    # severe drift; tighten to 200-500 to also catch moderate
-    # color shifts.
+    # the wrong identity. 0 disables. Default 300 catches
+    # moderate color shifts; raise to 500-1000 if too many
+    # false-positive fallbacks on clean generations.
     quality_max_face_outside_mouth_mse: float = Field(
-        1000.0,
+        300.0,
         ge=0.0,
         le=10000.0,
         description="Face-crop MSE ceiling outside the mouth ROI. 0 disables. Frame falls back to source when the post-processed face outside the deep mouth differs from the reference by more than this.",
+    )
+    # Localized color-block fallback. Divides the face crop into
+    # tiles (default 32x32) and computes per-tile MSE vs the
+    # reference. If any single tile exceeds this threshold, the
+    # frame falls back to source. This catches LOCAL color blocks
+    # that the mean-MSE drift check misses (mean is diluted by
+    # the rest of the face being clean, max is not). 0 disables.
+    # Default 500 catches a half-face color shift in one tile;
+    # tighten to 200-300 for stricter detection, raise to 1000+
+    # if false positives on legitimate content with high
+    # local detail (e.g., open mouth with teeth, hair).
+    quality_max_face_tile_mse: float = Field(
+        500.0,
+        ge=0.0,
+        le=10000.0,
+        description="Per-tile MSE ceiling on the face crop. 0 disables. Frame falls back to source if any tile differs from the reference by more than this.",
     )
     # Source-face motion-blur prefilter. Catches frames where the
     # detected face is too blurry (camera motion, fast head turn)
@@ -2794,6 +2810,44 @@ class MuseTalkApiRuntime:
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
     @staticmethod
+    def _face_max_tile_mse(
+        generated: np.ndarray,
+        reference: np.ndarray,
+        tile_size: int = 32,
+    ) -> float:
+        """Max per-tile MSE between the generated and reference
+        crops. Tiles are square ``tile_size x tile_size`` patches
+        tiled across the face. Returns the worst tile's MSE, which
+        is the right metric for catching LOCAL color blocks that
+        the mean-MSE drift check (which dilutes with clean
+        regions) misses.
+        """
+        if (
+            generated is None
+            or reference is None
+            or generated.size == 0
+            or reference.size == 0
+        ):
+            return 0.0
+        if generated.shape != reference.shape:
+            return 0.0
+        h, w = generated.shape[:2]
+        if tile_size <= 0 or tile_size > h or tile_size > w:
+            return 0.0
+        gen = generated.astype(np.float32)
+        ref = reference.astype(np.float32)
+        max_tile_mse = 0.0
+        for y in range(0, h, tile_size):
+            for x in range(0, w, tile_size):
+                y1 = min(y + tile_size, h)
+                x1 = min(x + tile_size, w)
+                tile_diff_sq = (gen[y:y1, x:x1] - ref[y:y1, x:x1]) ** 2
+                tile_mse = float(tile_diff_sq.mean())
+                if tile_mse > max_tile_mse:
+                    max_tile_mse = tile_mse
+        return max_tile_mse
+
+    @staticmethod
     def _face_outside_mouth_mse(generated: np.ndarray, reference: np.ndarray) -> float:
         """Mean squared error on the face crop, **excluding** the
         deep mouth ROI (y 55-80%, x 30-70%). The "non-mouth"
@@ -2889,6 +2943,7 @@ class MuseTalkApiRuntime:
         quality_min_sharpness_ratio: float,
         quality_mouth_min_laplacian: float,
         quality_max_face_outside_mouth_mse: float,
+        quality_max_face_tile_mse: float,
         face_parser: Optional[FaceParsing],
     ) -> List[str]:
         """Write every output frame to ``output_dir`` and return a
@@ -2975,6 +3030,14 @@ class MuseTalkApiRuntime:
                     quality_max_face_outside_mouth_mse > 0.0
                     and self._face_outside_mouth_mse(resized, reference_crop)
                     > quality_max_face_outside_mouth_mse
+                ):
+                    blend_status = "quality_fallback"
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
+                if (
+                    quality_max_face_tile_mse > 0.0
+                    and self._face_max_tile_mse(resized, reference_crop)
+                    > quality_max_face_tile_mse
                 ):
                     blend_status = "quality_fallback"
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
@@ -3589,6 +3652,7 @@ class MuseTalkApiRuntime:
                 payload.quality_min_sharpness_ratio,
                 payload.quality_mouth_min_laplacian,
                 payload.quality_max_face_outside_mouth_mse,
+                payload.quality_max_face_tile_mse,
                 face_parser,
             )
             quality_fallback_frames = sum(
