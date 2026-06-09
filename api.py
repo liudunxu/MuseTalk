@@ -256,7 +256,7 @@ class LipSyncRequest(BaseModel):
     extra_margin: int = Field(10, ge=0, le=100)
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
-    blend_mask_blur_ratio: float = Field(0.01, ge=0.0, le=0.2)
+    blend_mask_blur_ratio: float = Field(0.04, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.75, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.10, ge=0.0, le=1.0)
@@ -2666,15 +2666,36 @@ class MuseTalkApiRuntime:
                 if material is None:
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
+                mask_array, crop_box = material
                 resized = cv2.resize(
                     result_frame.astype(np.uint8),
                     (x2 - x1, y2 - y1),
                     interpolation=cv2.INTER_LANCZOS4,
                 )
                 reference_crop = original_frame[y1:y2, x1:x2]
-                resized = self._match_color_stats(resized, reference_crop, color_match_strength)
-                resized = self._restore_reference_detail(resized, reference_crop, mouth_detail_strength)
-                resized = self._sharpen_image(resized, mouth_sharpen_strength)
+                # Post-process the full crop first, then restrict the
+                # post-processing to the mask region. The area outside
+                # the mask is left as the raw generated face so the
+                # soft mask in ``get_image_blending`` transitions from
+                # raw generated -> original frame instead of from a
+                # heavily post-processed crop -> original frame. The
+                # latter produces a visible "irregular frame" around
+                # the mouth (color, detail, and sharpness all jump at
+                # the mask boundary).
+                post_processed = self._match_color_stats(
+                    resized, reference_crop, color_match_strength
+                )
+                post_processed = self._restore_reference_detail(
+                    post_processed, reference_crop, mouth_detail_strength
+                )
+                post_processed = self._sharpen_image(post_processed, mouth_sharpen_strength)
+                mask_face_box = mask_array[y1:y2, x1:x2]
+                mask_float = mask_face_box.astype(np.float32) / 255.0
+                mask_3d = mask_float[..., None]
+                resized = (
+                    resized.astype(np.float32) * (1.0 - mask_3d)
+                    + post_processed.astype(np.float32) * mask_3d
+                ).astype(np.uint8)
                 if quality_gate_enabled and self._is_low_quality_generation(
                     resized,
                     reference_crop,
@@ -2684,7 +2705,6 @@ class MuseTalkApiRuntime:
                     blend_status = "quality_fallback"
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
-                mask_array, crop_box = material
                 combined = get_image_blending(
                     original_frame,
                     resized,
