@@ -210,35 +210,37 @@ class LipSyncRequest(BaseModel):
     temporal_tracking_weight: float = Field(0.08, ge=0.0, le=0.5)
     target_fill_max_gap_seconds: float = Field(0.8, ge=0.0, le=3.0)
     target_fill_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
-    target_fill_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
+    target_fill_min_match_ratio: float = Field(0.30, ge=0.0, le=1.0)
     target_fill_max_center_shift: float = Field(0.8, ge=0.0, le=5.0)
     target_motion_gate_enabled: bool = True
-    target_motion_max_center_shift: float = Field(1.00, ge=0.0, le=5.0)
-    target_motion_max_scale_change: float = Field(0.55, ge=0.0, le=2.0)
+    target_motion_max_center_shift: float = Field(1.30, ge=0.0, le=5.0)
+    target_motion_max_scale_change: float = Field(0.70, ge=0.0, le=2.0)
     target_fast_motion_gate_enabled: bool = True
-    target_fast_motion_max_center_shift_per_frame: float = Field(0.35, ge=0.0, le=2.0)
-    target_fast_motion_max_scale_change_per_frame: float = Field(0.20, ge=0.0, le=2.0)
+    target_fast_motion_max_center_shift_per_frame: float = Field(0.50, ge=0.0, le=2.0)
+    target_fast_motion_max_scale_change_per_frame: float = Field(0.30, ge=0.0, le=2.0)
     target_fast_motion_min_run_frames: int = Field(2, ge=1, le=120)
     lipsync_continuity_max_gap_seconds: float = Field(0.80, ge=0.0, le=2.0)
-    lipsync_continuity_max_center_shift: float = Field(0.65, ge=0.0, le=5.0)
-    lipsync_continuity_max_scale_change: float = Field(0.55, ge=0.0, le=2.0)
+    lipsync_continuity_max_center_shift: float = Field(0.85, ge=0.0, le=5.0)
+    lipsync_continuity_max_scale_change: float = Field(0.70, ge=0.0, le=2.0)
     # Independent knobs for the second-pass continuity fill so it
     # does not silently inherit the initial gap-fill's window /
     # match-ratio. The second pass runs after motion + fast-motion +
     # mouth-diff filters, so it usually wants a slightly larger
     # window and a lower match ratio to recover bridged segments.
     lipsync_continuity_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
-    lipsync_continuity_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
+    lipsync_continuity_min_match_ratio: float = Field(0.30, ge=0.0, le=1.0)
     # Mouth-region pixel diff break: complementary to the embedding
     # similarity check. When the mouth region mean abs diff between
     # consecutive aligned face crops exceeds this fraction, treat the
     # next frame as a continuity break -- catches face switches the
     # embedding check misses (similar-looking people, side faces).
-    # 0 disables. Default 0.45 sits above typical cross-person diff
-    # (0.10-0.30) so it only fires on hard face switches; raise
-    # further or set to 0 to effectively disable.
+    # 0 disables. Default 0.60 sits well above both same-person
+    # speech motion (open/close transitions reach ~0.30-0.50) and
+    # typical cross-person diff (0.10-0.30), so it only fires on
+    # hard face switches; lower to ~0.50 to be more aggressive,
+    # raise or set to 0 to effectively disable.
     lipsync_mouth_diff_break_threshold: float = Field(
-        0.45, ge=0.0, le=1.0,
+        0.60, ge=0.0, le=1.0,
         description="Mouth-region mean abs diff break threshold; 0 disables.",
     )
     target_bbox_smoothing_window: int = Field(3, ge=1, le=15)
@@ -2049,8 +2051,17 @@ class MuseTalkApiRuntime:
                 continue
 
             frame_gap = max(1, index - previous_index)
-            center_shift = self._bbox_center_shift(previous_bbox, current_bbox) / frame_gap
-            scale_change = self._bbox_scale_change(previous_bbox, current_bbox) / frame_gap
+            # Cap the gap at 2: when valid frames are sparse (other
+            # filters or detection losses in between) dividing by the
+            # raw frame_gap dilutes a real single-frame jump down to
+            # near-zero, so genuine detection errors that need to be
+            # filtered slip through. Capping keeps the per-frame
+            # semantics for actual consecutive motion (gap == 1) and
+            # a "within 2 frames" view for sparse gaps, matching the
+            # spirit of the threshold.
+            effective_gap = min(frame_gap, 2)
+            center_shift = self._bbox_center_shift(previous_bbox, current_bbox) / effective_gap
+            scale_change = self._bbox_scale_change(previous_bbox, current_bbox) / effective_gap
             if (
                 (max_center_shift_per_frame > 0.0 and center_shift > max_center_shift_per_frame)
                 or (max_scale_change_per_frame > 0.0 and scale_change > max_scale_change_per_frame)
