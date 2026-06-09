@@ -243,8 +243,8 @@ class LipSyncRequest(BaseModel):
         0.60, ge=0.0, le=1.0,
         description="Mouth-region mean abs diff break threshold; 0 disables.",
     )
-    target_bbox_smoothing_window: int = Field(5, ge=1, le=15)
-    target_bbox_smoothing_max_center_shift: float = Field(0.85, ge=0.0, le=5.0)
+    target_bbox_smoothing_window: int = Field(7, ge=1, le=15)
+    target_bbox_smoothing_max_center_shift: float = Field(1.0, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
@@ -434,7 +434,7 @@ class LipSyncRequest(BaseModel):
     # Per-request 0.2-0.3 is a light smooth, 0.4-0.5 is heavy
     # and may ghost on fast motion.
     output_temporal_blend: float = Field(
-        0.0,
+        0.20,
         ge=0.0,
         le=0.9,
         description="Output-level temporal blend with the previous frame. 0 disables.",
