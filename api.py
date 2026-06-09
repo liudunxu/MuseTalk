@@ -407,7 +407,7 @@ class LipSyncRequest(BaseModel):
         0.0,
         ge=0.0,
         le=1.0,
-        description="Cross-frame face lock IoU floor (no-avatar path). 0 disables.",
+        description="Cross-frame face lock IoU floor (no-avatar path). 0 disables. Strict bbox-overlap lock; prefer the center-shift ratio below for motion-heavy videos.",
     )
     # Cross-frame face lock via bbox center distance (no-avatar
     # path). Filters candidates to those whose bbox center is
@@ -1936,28 +1936,35 @@ class MuseTalkApiRuntime:
         track_max_center_shift_ratio: float = 0.0,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         """Pick the face whose mouth is most open in the current
-        frame. Used by the no-avatar fast path where cross-frame
-        identity matching is skipped -- when several people are in
-        the frame, the actively speaking one usually has the most
-        open mouth, which is what we want to drive lip-sync on.
+        frame, with a soft cross-frame lock to keep the same
+        target across consecutive frames. Used by the no-avatar
+        fast path.
 
-        When ``previous_bbox`` is provided, the picker can lock
-        onto the same face across frames via one of two
-        distance metrics (whichever the caller enables):
+        The picker does TWO passes:
 
-          - ``track_min_iou > 0``: bbox IoU against ``previous_bbox``.
-            Catches same-face matches but breaks under fast
-            camera/head motion (bbox shape changes).
+        1. Among candidates that pass the size/detection filters
+           AND the cross-frame lock, pick the most-open-mouth.
+           This is the "preferred" face (the tracked target).
+        2. Among ALL candidates that pass the size/detection
+           filters (lock ignored), pick the most-open-mouth.
+           This is the "fallback" if no candidate passes the
+           lock -- e.g., the tracked face briefly left the
+           frame or moved outside the lock window.
 
+        The preferred face wins when it exists; the fallback is
+        only used when the lock filters out every candidate. This
+        way, fast motion never causes the picker to give up --
+        the lipsync keeps editing, but the lock still steers it
+        toward the previously-tracked face when possible.
+
+        Lock knobs (both default 0 = disabled):
+          - ``track_min_iou > 0``: bbox IoU against
+            ``previous_bbox``. Strict bbox-overlap check; breaks
+            under bbox shape / scale changes.
           - ``track_max_center_shift_ratio > 0``: bbox center
             distance normalized by the previous face width.
-            Robust to bbox shape / scale changes; tolerates
-            motion as long as the face does not move more than
-            ``ratio`` face widths per frame.
-
-        When no candidate clears the lock, the picker falls back
-        to the most-open-mouth face (treats the tracked face as
-        lost). 0 disables both locks.
+            Robust to shape / scale changes; tolerates motion
+            up to ``ratio`` face widths per frame.
 
         Returns ``(bbox, detection_score)`` or ``(None, 0.0)`` if
         no face passes the basic size/detection filters.
@@ -1973,9 +1980,35 @@ class MuseTalkApiRuntime:
                 1, int(previous_bbox[2]) - int(previous_bbox[0])
             )
 
-        best_bbox = None
-        best_openness = -1.0
-        best_detection_score = 0.0
+        def _passes_lock(bbox: Tuple[int, int, int, int]) -> bool:
+            if previous_bbox is None:
+                return True
+            if track_min_iou > 0.0:
+                if _box_iou(previous_bbox, bbox) < track_min_iou:
+                    return False
+            if track_max_center_shift_ratio > 0.0:
+                pcx, pcy = _box_center(previous_bbox)
+                ccx, ccy = _box_center(bbox)
+                dist = math.hypot(pcx - ccx, pcy - ccy)
+                if dist > track_max_center_shift_ratio * prev_face_width:
+                    return False
+            return True
+
+        def _openness(bbox: Tuple[int, int, int, int]) -> float:
+            x1, y1, x2, y2 = bbox
+            crop = frame[
+                max(0, y1):min(frame.shape[0], y2),
+                max(0, x1):min(frame.shape[1], x2),
+            ]
+            return self._mouth_openness_score(crop)
+
+        best_locked_bbox = None
+        best_locked_openness = -1.0
+        best_locked_detection_score = 0.0
+        best_unlocked_bbox = None
+        best_unlocked_openness = -1.0
+        best_unlocked_detection_score = 0.0
+        any_passed_filters = False
         for bbox, detection_score in face_boxes:
             if not self._passes_face_filters(
                 frame,
@@ -1988,27 +2021,29 @@ class MuseTalkApiRuntime:
                 min_landmark_overlap,
             ):
                 continue
-            if previous_bbox is not None:
-                if track_min_iou > 0.0:
-                    iou = _box_iou(previous_bbox, bbox)
-                    if iou < track_min_iou:
-                        continue
-                if track_max_center_shift_ratio > 0.0:
-                    pcx, pcy = _box_center(previous_bbox)
-                    ccx, ccy = _box_center(bbox)
-                    dist = math.hypot(pcx - ccx, pcy - ccy)
-                    if dist > track_max_center_shift_ratio * prev_face_width:
-                        continue
-            x1, y1, x2, y2 = bbox
-            face_crop = frame[
-                max(0, y1):min(frame.shape[0], y2),
-                max(0, x1):min(frame.shape[1], x2),
-            ]
-            openness = self._mouth_openness_score(face_crop)
-            if openness > best_openness:
-                best_openness = openness
-                best_bbox = bbox
-                best_detection_score = float(detection_score)
+            any_passed_filters = True
+            openness = _openness(bbox)
+            if openness > best_unlocked_openness:
+                best_unlocked_openness = openness
+                best_unlocked_bbox = bbox
+                best_unlocked_detection_score = float(detection_score)
+            if _passes_lock(bbox) and openness > best_locked_openness:
+                best_locked_openness = openness
+                best_locked_bbox = bbox
+                best_locked_detection_score = float(detection_score)
+
+        if not any_passed_filters:
+            return None, 0.0
+        # Lock preferred, but fall back to the most-open-mouth
+        # face overall if no candidate cleared the lock. This
+        # keeps lipsync running on motion-heavy frames instead of
+        # giving up.
+        if best_locked_bbox is not None:
+            best_bbox = best_locked_bbox
+            best_detection_score = best_locked_detection_score
+        else:
+            best_bbox = best_unlocked_bbox
+            best_detection_score = best_unlocked_detection_score
 
         if best_bbox is None:
             return None, 0.0
