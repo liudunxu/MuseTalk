@@ -2913,7 +2913,7 @@ class MuseTalkApiRuntime:
                 raise RuntimeError(detail)
             target_identity = self._find_target_identity(frames, fps, avatar_descriptor, payload)
             if target_identity and target_identity.get("no_face_detected"):
-                return {
+                no_face_response = {
                     "passthrough": True,
                     "passthrough_reason": "no_face_detected",
                     "source_frame_count": len(frames),
@@ -2999,6 +2999,8 @@ class MuseTalkApiRuntime:
                     },
                     "quality_ok": True,
                 }
+                _log_lipsync_report(job_id, no_face_response)
+                return no_face_response
             target_descriptors = target_identity.get("target_descriptors") if target_identity else []
             negative_descriptors = target_identity.get("negative_descriptors") if target_identity else []
             target_identity_score = (
@@ -3380,6 +3382,72 @@ def _output_url(request: Request, output_path: Path) -> str:
     return f"https://{request.url.netloc}/outputs/{relative}"
 
 
+def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
+    """Emit a multi-line INFO summary of the ``/api/lipsync``
+    response. Designed to be the canonical one-stop log line for
+    diagnosing filter strictness: every per-filter count and the
+    provenance breakdown are included so a single log entry is
+    enough to tell which gate is over-firing.
+
+    ``frame_provenance`` is summarized into per-status counts
+    rather than printed in full (the list can be hundreds of
+    entries on a long video).
+    """
+    provenance = result.get("frame_provenance") or []
+    prov_counts = {
+        "passthrough": 0,
+        "generated": 0,
+        "quality_fallback": 0,
+        "blend_error": 0,
+    }
+    for status in provenance:
+        prov_counts[status] = prov_counts.get(status, 0) + 1
+    speech_gate = result.get("speech_gate") or {}
+    codeformer = result.get("codeformer") or {}
+    logger.info(
+        "[LipSync-report] job_id=%s\n"
+        "  source: src_frames=%d out_frames=%d src_fps=%.3f audio_fps=%.3f\n"
+        "  identity: source=%s count=%d coverage=%.3f sim=%.3f backend=%s\n"
+        "  target: matched=%d filled_init=%d continuity_filled=%d smoothed=%d eligible=%d\n"
+        "  filtered: motion=%d fast_motion=%d mouth_diff=%d small_face=%d short_segment=%d\n"
+        "  generated: gen=%d quality_fallback=%d passthrough=%d blend_error=%d\n"
+        "  identity_sim: min/med/max=%.3f/%.3f/%.3f\n"
+        "  speech_gate: enabled=%s active=%s\n"
+        "  codeformer: enabled=%s available=%s",
+        job_id,
+        int(result.get("source_frame_count", 0)),
+        int(result.get("output_frame_count", 0)),
+        float(result.get("source_fps", 0.0)),
+        float(result.get("audio_feature_fps", 0.0)),
+        result.get("target_identity_source", "none"),
+        int(result.get("target_identity_count", 0)),
+        float(result.get("target_identity_coverage", 0.0)),
+        float(result.get("target_identity_similarity", 0.0)),
+        result.get("face_identity_backend", "unknown"),
+        int(result.get("matched_source_frames", 0)),
+        int(result.get("filled_source_frames", 0)),
+        int(result.get("continuity_filled_source_frames", 0)),
+        int(result.get("smoothed_source_frames", 0)),
+        int(result.get("eligible_source_frames", 0)),
+        int(result.get("filtered_motion_frames", 0)),
+        int(result.get("filtered_fast_motion_frames", 0)),
+        int(result.get("filtered_mouth_diff_frames", 0)),
+        int(result.get("filtered_small_face_frames", 0)),
+        int(result.get("filtered_short_segment_frames", 0)),
+        int(result.get("generated_output_frames", 0)),
+        int(result.get("quality_fallback_frames", 0)),
+        prov_counts["passthrough"],
+        prov_counts["blend_error"],
+        float(result.get("identity_similarity_min", 0.0)),
+        float(result.get("identity_similarity_median", 0.0)),
+        float(result.get("identity_similarity_max", 0.0)),
+        bool(speech_gate.get("enabled", False)),
+        int(speech_gate.get("active_frames", 0)),
+        bool(codeformer.get("requested", False)),
+        bool(codeformer.get("runtime_available", False)),
+    )
+
+
 def _local_output_from_url(url: str) -> Optional[Path]:
     parsed = urlparse(url)
     path = parsed.path
@@ -3507,6 +3575,12 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
         output_path = result.pop("output_path")
         video_url = _output_url(request, output_path)
     download_url = f"https://{request.url.netloc}/api/download?url={quote(video_url, safe='')}"
+    response_body = {
+        "job_id": job_id,
+        "video_url": video_url,
+        "download_url": download_url,
+        **result,
+    }
     logger.info(
         "[LipSync] job_id=%s video_url=%s download_url=%s passthrough=%s",
         job_id,
@@ -3514,12 +3588,8 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
         download_url,
         bool(result.get("passthrough")),
     )
-    return {
-        "job_id": job_id,
-        "video_url": video_url,
-        "download_url": download_url,
-        **result,
-    }
+    _log_lipsync_report(job_id, response_body)
+    return response_body
 
 
 @app.get("/api/download")
