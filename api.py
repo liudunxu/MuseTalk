@@ -3464,10 +3464,18 @@ def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, objec
     else:
         output_path = result.pop("output_path")
         video_url = _output_url(request, output_path)
+    download_url = f"{str(request.base_url).rstrip('/')}/api/download?url={quote(video_url, safe='')}"
+    logger.info(
+        "[LipSync] job_id=%s video_url=%s download_url=%s passthrough=%s",
+        job_id,
+        video_url,
+        download_url,
+        bool(result.get("passthrough")),
+    )
     return {
         "job_id": job_id,
         "video_url": video_url,
-        "download_url": f"{str(request.base_url).rstrip('/')}/api/download?url={quote(video_url, safe='')}",
+        "download_url": download_url,
         **result,
     }
 
