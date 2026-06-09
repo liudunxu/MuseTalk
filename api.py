@@ -506,13 +506,19 @@ def _describe_target_identity_source(
       - "avatar_fallback:<most_frequent_face|first_largest_face>":
         avatar was provided but no cluster cleared the similarity
         threshold, so we fell back to the no-avatar heuristic.
+      - "largest_face_per_frame": no avatar provided; per-frame
+        loop picks the largest face in each frame directly,
+        without cross-frame identity matching.
       - "<most_frequent_face|first_largest_face>": no avatar
-        provided; heuristic pick from the source video.
+        provided; heuristic pick from the source video (legacy
+        no-avatar path; not used by the default flow anymore).
       - "none": no face detected in the source video (passthrough).
     """
     if target_identity is None:
         return "none"
     selection_source = target_identity.get("selection_source")
+    if selection_source == "largest_face_per_frame":
+        return "largest_face_per_frame"
     if avatar_descriptor is not None and selection_source in (
         "most_frequent_face",
         "first_largest_face",
@@ -1711,6 +1717,63 @@ class MuseTalkApiRuntime:
         target_bbox = self._landmark_bbox_for_face(landmarks, best_bbox, bbox_shift, frame.shape)
         return target_bbox, best_score
 
+    def _select_largest_face_bbox(
+        self,
+        frame: np.ndarray,
+        bbox_shift: int,
+        min_detection_score: float,
+        require_landmark_match: bool,
+        min_landmark_points: int,
+        min_landmark_overlap: float,
+    ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
+        """Pick the largest face in the current frame, ignoring
+        identity. Used by the no-avatar fast path where cross-frame
+        identity matching is skipped -- the largest face in a frame
+        is almost always the main subject.
+
+        Returns ``(bbox, detection_score)`` or ``(None, 0.0)`` if
+        no face passes the basic size/detection filters.
+        """
+        face_boxes = self._detect_face_boxes(frame)
+        if not face_boxes:
+            return None, 0.0
+
+        best_bbox = None
+        best_area = 0
+        best_score = 0.0
+        for bbox, detection_score in face_boxes:
+            if not self._passes_face_filters(
+                frame,
+                bbox,
+                detection_score,
+                min_detection_score,
+                [],
+                False,
+                min_landmark_points,
+                min_landmark_overlap,
+            ):
+                continue
+            area = _box_area(bbox)
+            if area > best_area:
+                best_area = area
+                best_bbox = bbox
+                best_score = float(detection_score)
+
+        if best_bbox is None:
+            return None, 0.0
+
+        landmarks = self._pose_face_landmarks(frame) if require_landmark_match else []
+        if require_landmark_match and not self._face_box_matches_landmarks(
+            landmarks,
+            best_bbox,
+            frame.shape,
+            min_landmark_points,
+            min_landmark_overlap,
+        ):
+            landmarks = []
+        target_bbox = self._landmark_bbox_for_face(landmarks, best_bbox, bbox_shift, frame.shape)
+        return target_bbox, best_score
+
     def _find_target_identity(
         self,
         frames: List[np.ndarray],
@@ -1718,6 +1781,23 @@ class MuseTalkApiRuntime:
         avatar_descriptor: Optional[Dict[str, np.ndarray]],
         payload: LipSyncRequest,
     ) -> Optional[Dict[str, object]]:
+        if avatar_descriptor is None:
+            # No avatar: skip cross-frame identity matching entirely.
+            # The per-frame loop picks the largest face in each frame
+            # directly. This avoids unstable cluster behavior (low
+            # coverage, count=2 from a noisy detector) and is the
+            # right default when the caller has not specified a
+            # target identity -- the largest face in a frame is
+            # almost always the main subject.
+            return {
+                "selection_source": "largest_face_per_frame",
+                "avatar_score": 0.0,
+                "count": 0,
+                "identity_coverage": 0.0,
+                "target_descriptors": [],
+                "negative_descriptors": [],
+                "no_face_detected": False,
+            }
         clusters: List[Dict[str, object]] = []
         sample_interval = payload.identity_scan_interval or max(1, int(round(fps / 2.0)))
         frame_indices = range(0, len(frames), sample_interval)
@@ -3009,6 +3089,9 @@ class MuseTalkApiRuntime:
             matched_source_frames = 0
             best_scores = []
             previous_bbox = None
+            largest_face_mode = bool(
+                target_identity and target_identity.get("selection_source") == "largest_face_per_frame"
+            )
             for frame in _progress(frames, "match target", total=len(frames), unit="frame"):
                 if target_descriptors:
                     bbox, score = self._select_target_bbox(
@@ -3028,6 +3111,15 @@ class MuseTalkApiRuntime:
                         crop_embedding_min_detection_score=payload.crop_embedding_min_detection_score,
                         previous_bbox=previous_bbox,
                         temporal_tracking_weight=payload.temporal_tracking_weight,
+                    )
+                elif largest_face_mode:
+                    bbox, score = self._select_largest_face_bbox(
+                        frame,
+                        payload.bbox_shift,
+                        payload.min_detection_score,
+                        payload.require_landmark_match,
+                        payload.min_landmark_points,
+                        payload.min_landmark_overlap,
                     )
                 else:
                     bbox, score = None, 0.0
