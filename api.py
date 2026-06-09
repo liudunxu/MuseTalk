@@ -258,10 +258,10 @@ class LipSyncRequest(BaseModel):
     extra_margin: int = Field(10, ge=0, le=100)
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
-    blend_mask_blur_ratio: float = Field(0.025, ge=0.0, le=0.2)
+    blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.20, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default.
@@ -289,6 +289,33 @@ class LipSyncRequest(BaseModel):
         ge=0.0,
         le=1.0,
         description="Disable quality fallback for this run if it would skip more than this fraction of non-prefiltered frames.",
+    )
+    # Mouth-region postfilter. Catches a single large blurry patch
+    # in the generated mouth (CodeFormer failure, VAE collapse)
+    # that the whole-image quality gate misses because the
+    # surrounding face still looks fine. When the mouth-ROI
+    # Laplacian variance drops below this threshold, the frame
+    # falls back to the source. 0 disables. Reasonable values
+    # for 256x256 face crops sit in the 1.0-5.0 range; tune
+    # upward if too many false-positive fallbacks.
+    quality_mouth_min_laplacian: float = Field(
+        0.0,
+        ge=0.0,
+        le=2000.0,
+        description="Mouth-region Laplacian floor. 0 disables. Frame falls back to source if the generated mouth ROI variance is below this.",
+    )
+    # Source-face motion-blur prefilter. Catches frames where the
+    # detected face is too blurry (camera motion, fast head turn)
+    # to produce useful lip-sync output. When the face-crop
+    # Laplacian variance is below this threshold, the frame is
+    # treated as having no target and falls through to passthrough.
+    # 0 disables. Reasonable values for ~200x200 face crops sit
+    # in the 30-100 range; raise if too aggressive.
+    prefilter_min_face_laplacian: float = Field(
+        0.0,
+        ge=0.0,
+        le=2000.0,
+        description="Source-face Laplacian floor. 0 disables. Frame is skipped (passthrough) if the source face-crop variance is below this.",
     )
     # Side-face / fast-turn prefilters (diffusion-only). MuseTalk does
     # not currently implement yaw-based skipping; values are accepted
@@ -375,13 +402,12 @@ class LipSyncRequest(BaseModel):
         description="Run CodeFormer face restoration on the aligned face crops before paste-back.",
     )
     codeformer_fidelity_weight: float = Field(
-        0.5,
+        0.3,
         ge=0.0,
         le=1.0,
         description="CodeFormer fidelity weight. 0 = sharpest (most codebook-driven, identity drift), "
-                    "1 = closest to input. Default 0.5 is tuned for lip-sync output where the "
-                    "generated mouth is the priority: the lower value lets CodeFormer add visible "
-                    "high-frequency detail to the lips and teeth. Raise to 0.7-0.85 to better "
+                    "1 = closest to input. Default 0.3 prioritizes visible mouth detail (lips, "
+                    "teeth) over fidelity to the inpainter's output. Raise to 0.5-0.85 to better "
                     "preserve the inpainter's lipsync against the codebook's 'typical' face.",
     )
     codeformer_adain: bool = Field(
@@ -2706,6 +2732,28 @@ class MuseTalkApiRuntime:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
+    @staticmethod
+    def _mouth_region_laplacian(face_crop: np.ndarray) -> float:
+        """Laplacian variance over the mouth ROI of a face crop.
+
+        Used by the postfilter to detect a blurry-patch mouth even
+        when the surrounding face looks fine. Mouth region follows
+        the same y 55-80% / x 30-70% as
+        ``_mouth_openness_score``.
+        """
+        if face_crop is None or face_crop.size == 0:
+            return 0.0
+        h, w = face_crop.shape[:2]
+        y0, y1 = int(h * 0.55), int(h * 0.80)
+        x0, x1 = int(w * 0.30), int(w * 0.70)
+        if y1 <= y0 or x1 <= x0:
+            return 0.0
+        mouth = face_crop[y0:y1, x0:x1]
+        if mouth.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(mouth, cv2.COLOR_BGR2GRAY)
+        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
     def _is_low_quality_generation(
         self,
         image: np.ndarray,
@@ -2740,6 +2788,7 @@ class MuseTalkApiRuntime:
         quality_gate_enabled: bool,
         quality_min_laplacian: float,
         quality_min_sharpness_ratio: float,
+        quality_mouth_min_laplacian: float,
         face_parser: Optional[FaceParsing],
     ) -> List[str]:
         """Write every output frame to ``output_dir`` and return a
@@ -2812,6 +2861,19 @@ class MuseTalkApiRuntime:
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
                 resized = self._restore_reference_detail(resized, reference_crop, mouth_detail_strength)
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
+                # Mouth-region postfilter. Catches a single large
+                # blurry patch in the generated mouth (CodeFormer
+                # failure, VAE collapse) that the whole-image
+                # quality gate misses because the surrounding face
+                # still looks fine.
+                if (
+                    quality_mouth_min_laplacian > 0.0
+                    and self._mouth_region_laplacian(resized)
+                    < quality_mouth_min_laplacian
+                ):
+                    blend_status = "quality_fallback"
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
                 if quality_gate_enabled and self._is_low_quality_generation(
                     resized,
                     reference_crop,
@@ -3127,6 +3189,7 @@ class MuseTalkApiRuntime:
 
             targets = []
             matched_source_frames = 0
+            prefiltered_blur_frames = 0
             best_scores = []
             previous_bbox = None
             largest_face_mode = bool(
@@ -3163,6 +3226,27 @@ class MuseTalkApiRuntime:
                     )
                 else:
                     bbox, score = None, 0.0
+                # Motion-blur prefilter on the source face. When the
+                # detected face crop is too blurry the lipsync output
+                # would be even worse (CodeFormer cannot recover what
+                # the source never had), so we drop the target and
+                # let the frame passthrough.
+                if (
+                    bbox is not None
+                    and payload.prefilter_min_face_laplacian > 0.0
+                ):
+                    fx1, fy1, fx2, fy2 = bbox
+                    face_crop = frame[
+                        max(0, fy1):min(frame.shape[0], fy2),
+                        max(0, fx1):min(frame.shape[1], fx2),
+                    ]
+                    if (
+                        self._laplacian_variance(face_crop)
+                        < payload.prefilter_min_face_laplacian
+                    ):
+                        bbox = None
+                        score = 0.0
+                        prefiltered_blur_frames += 1
                 targets.append({"bbox": bbox, "score": score})
                 best_scores.append(score)
                 if bbox is not None:
@@ -3385,6 +3469,7 @@ class MuseTalkApiRuntime:
                 payload.quality_gate_enabled,
                 payload.quality_min_laplacian,
                 payload.quality_min_sharpness_ratio,
+                payload.quality_mouth_min_laplacian,
                 face_parser,
             )
             quality_fallback_frames = sum(
@@ -3418,6 +3503,7 @@ class MuseTalkApiRuntime:
                 "continuity_filled_source_frames": continuity_filled_source_frames,
                 "filtered_small_face_frames": filtered_small_face_frames,
                 "filtered_short_segment_frames": filtered_short_segment_frames,
+                "prefiltered_blur_frames": prefiltered_blur_frames,
                 "smoothed_source_frames": smoothed_source_frames,
                 "matched_or_filled_source_frames": (
                     matched_source_frames + filled_source_frames + continuity_filled_source_frames
@@ -3530,7 +3616,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         "[LipSync-report] job_id=%s\n"
         "  source: src_frames=%d out_frames=%d src_fps=%.3f audio_fps=%.3f\n"
         "  identity: source=%s count=%d coverage=%.3f sim=%.3f backend=%s\n"
-        "  target: matched=%d filled_init=%d continuity_filled=%d smoothed=%d eligible=%d\n"
+        "  target: matched=%d filled_init=%d continuity_filled=%d smoothed=%d eligible=%d prefiltered_blur=%d\n"
         "  filtered: motion=%d fast_motion=%d mouth_diff=%d small_face=%d short_segment=%d\n"
         "  generated: gen=%d quality_fallback=%d passthrough=%d blend_error=%d\n"
         "  identity_sim: min/med/max=%.3f/%.3f/%.3f\n"
@@ -3551,6 +3637,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         int(result.get("continuity_filled_source_frames", 0)),
         int(result.get("smoothed_source_frames", 0)),
         int(result.get("eligible_source_frames", 0)),
+        int(result.get("prefiltered_blur_frames", 0)),
         int(result.get("filtered_motion_frames", 0)),
         int(result.get("filtered_fast_motion_frames", 0)),
         int(result.get("filtered_mouth_diff_frames", 0)),
