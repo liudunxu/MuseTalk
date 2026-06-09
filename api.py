@@ -2703,29 +2703,33 @@ class MuseTalkApiRuntime:
 
         image_float = image.astype(np.float32)
         reference_float = reference.astype(np.float32)
-        # Restrict the statistics to the upper face (y < 55% of the
-        # crop), which is the area outside the mouth ROI used by
-        # ``_mouth_region_diff`` (y 55-74%). Matching on the mouth
-        # itself would dim bright lip frames toward the source's
-        # neutral mouth color and reduce the lipsync contrast we
-        # are trying to preserve.
+        # Compute color stats on the upper face only (y < 55%) so the
+        # mouth area (y 55-100%) doesn't pull the stats toward lip/
+        # teeth colors. Apply the color transfer ONLY to the upper
+        # face -- the mouth is left untouched and keeps its
+        # generated colors. Applying the transfer to the whole crop
+        # shifts the mouth's color toward the upper-face reference
+        # and produces a visible color band in the lip area.
         height = image_float.shape[0]
         cutoff = int(height * 0.55)
-        if cutoff > 1 and cutoff < height - 1:
-            image_upper = image_float[:cutoff, :, :]
-            reference_upper = reference_float[:cutoff, :, :]
-        else:
-            image_upper = image_float
-            reference_upper = reference_float
+        if cutoff <= 1 or cutoff >= height - 1:
+            return image
+        image_upper = image_float[:cutoff, :, :]
+        reference_upper = reference_float[:cutoff, :, :]
         image_mean, image_std = cv2.meanStdDev(image_upper)
         reference_mean, reference_std = cv2.meanStdDev(reference_upper)
         image_mean = image_mean.reshape(1, 1, 3)
         image_std = image_std.reshape(1, 1, 3)
         reference_mean = reference_mean.reshape(1, 1, 3)
         reference_std = reference_std.reshape(1, 1, 3)
-        matched = (image_float - image_mean) * (reference_std / np.maximum(image_std, 1.0)) + reference_mean
-        blended = image_float * (1.0 - strength) + matched * strength
-        return np.clip(blended, 0, 255).astype(np.uint8)
+        matched_upper = (
+            (image_upper - image_mean)
+            * (reference_std / np.maximum(image_std, 1.0))
+            + reference_mean
+        )
+        blended_upper = image_upper * (1.0 - strength) + matched_upper * strength
+        image_float[:cutoff, :, :] = blended_upper
+        return np.clip(image_float, 0, 255).astype(np.uint8)
 
     def _sharpen_image(self, image: np.ndarray, strength: float) -> np.ndarray:
         if strength <= 0.0 or image.size == 0:
