@@ -398,17 +398,32 @@ class LipSyncRequest(BaseModel):
     # whose bbox has IoU >= this value against the previous
     # frame's accepted bbox. Prevents the lipsync target from
     # switching to a different person when the camera pans
-    # between two faces (the "face switching" artifact). When no
-    # candidate has enough IoU, the picker falls back to the
-    # most-open-mouth face. 0 disables (free picking each
-    # frame). Default 0.1 is loose enough to tolerate normal
-    # bbox jitter; raise to 0.3 for stricter lock, lower to 0.05
-    # for very loose.
+    # between two faces (the "face switching" artifact). 0
+    # disables (free picking each frame). IoU is sensitive to
+    # bbox overlap and breaks under fast camera/head motion;
+    # prefer the center-shift ratio below for motion-heavy
+    # videos.
     target_track_min_iou: float = Field(
-        0.1,
+        0.0,
         ge=0.0,
         le=1.0,
-        description="Cross-frame face lock IoU floor (no-avatar path). 0 disables. Default 0.1 = loose lock to prevent target switching.",
+        description="Cross-frame face lock IoU floor (no-avatar path). 0 disables.",
+    )
+    # Cross-frame face lock via bbox center distance (no-avatar
+    # path). Filters candidates to those whose bbox center is
+    # within ``this value * (previous face width)`` of the
+    # previous frame's bbox center. More robust than IoU for
+    # motion-heavy videos (camera pan / head turn) because it
+    # only depends on center distance, not on bbox shape or
+    # overlap. 0 disables. Per-request 1.5 = strict (lock only
+    # when face stays within 1.5 face widths), 3.0 = loose
+    # (tolerate more motion), 5.0+ = essentially disabled
+    # without setting 0.
+    target_track_max_center_shift_ratio: float = Field(
+        2.0,
+        ge=0.0,
+        le=20.0,
+        description="Cross-frame face lock via bbox center distance, normalized by previous face width. 0 disables. Default 2.0 = face within 2 face widths of last frame.",
     )
     # Output-level temporal blend. After all post-processing,
     # mixes the current face crop with the previous frame's face
@@ -1918,6 +1933,7 @@ class MuseTalkApiRuntime:
         min_landmark_overlap: float,
         previous_bbox: Optional[Tuple[int, int, int, int]] = None,
         track_min_iou: float = 0.0,
+        track_max_center_shift_ratio: float = 0.0,
     ) -> Tuple[Optional[Tuple[int, int, int, int]], float]:
         """Pick the face whose mouth is most open in the current
         frame. Used by the no-avatar fast path where cross-frame
@@ -1925,15 +1941,23 @@ class MuseTalkApiRuntime:
         the frame, the actively speaking one usually has the most
         open mouth, which is what we want to drive lip-sync on.
 
-        When ``previous_bbox`` is provided AND ``track_min_iou >
-        0``, the picker locks onto the same face across frames by
-        filtering candidates to those with IoU >= ``track_min_iou``
-        against the previous bbox. This prevents the lipsync
-        target from switching to a different person when the
-        camera pans or another face becomes briefly the largest
-        in frame (the "face switching" artifact). When no
-        candidate has enough IoU, the picker falls back to the
-        most-open-mouth face (treats the tracked face as lost).
+        When ``previous_bbox`` is provided, the picker can lock
+        onto the same face across frames via one of two
+        distance metrics (whichever the caller enables):
+
+          - ``track_min_iou > 0``: bbox IoU against ``previous_bbox``.
+            Catches same-face matches but breaks under fast
+            camera/head motion (bbox shape changes).
+
+          - ``track_max_center_shift_ratio > 0``: bbox center
+            distance normalized by the previous face width.
+            Robust to bbox shape / scale changes; tolerates
+            motion as long as the face does not move more than
+            ``ratio`` face widths per frame.
+
+        When no candidate clears the lock, the picker falls back
+        to the most-open-mouth face (treats the tracked face as
+        lost). 0 disables both locks.
 
         Returns ``(bbox, detection_score)`` or ``(None, 0.0)`` if
         no face passes the basic size/detection filters.
@@ -1943,6 +1967,11 @@ class MuseTalkApiRuntime:
             return None, 0.0
 
         landmarks = self._pose_face_landmarks(frame) if require_landmark_match else []
+        prev_face_width = 1
+        if previous_bbox is not None:
+            prev_face_width = max(
+                1, int(previous_bbox[2]) - int(previous_bbox[0])
+            )
 
         best_bbox = None
         best_openness = -1.0
@@ -1959,10 +1988,17 @@ class MuseTalkApiRuntime:
                 min_landmark_overlap,
             ):
                 continue
-            if previous_bbox is not None and track_min_iou > 0.0:
-                iou = _box_iou(previous_bbox, bbox)
-                if iou < track_min_iou:
-                    continue
+            if previous_bbox is not None:
+                if track_min_iou > 0.0:
+                    iou = _box_iou(previous_bbox, bbox)
+                    if iou < track_min_iou:
+                        continue
+                if track_max_center_shift_ratio > 0.0:
+                    pcx, pcy = _box_center(previous_bbox)
+                    ccx, ccy = _box_center(bbox)
+                    dist = math.hypot(pcx - ccx, pcy - ccy)
+                    if dist > track_max_center_shift_ratio * prev_face_width:
+                        continue
             x1, y1, x2, y2 = bbox
             face_crop = frame[
                 max(0, y1):min(frame.shape[0], y2),
@@ -3619,6 +3655,7 @@ class MuseTalkApiRuntime:
                         payload.min_landmark_overlap,
                         previous_bbox=previous_bbox,
                         track_min_iou=payload.target_track_min_iou,
+                        track_max_center_shift_ratio=payload.target_track_max_center_shift_ratio,
                     )
                 else:
                     bbox, score = None, 0.0
