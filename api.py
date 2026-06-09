@@ -2729,9 +2729,19 @@ class MuseTalkApiRuntime:
                     mask_array,
                     crop_box,
                 )
-            except Exception:
+            except Exception as exc:
                 blend_status = "blend_error"
                 combined = original_frame
+                logger.warning(
+                    "[LipSync] blend_error output_index=%d source_index=%d "
+                    "bbox=(%d,%d,%d,%d) face_crop_shape=%s: %s",
+                    output_index,
+                    source_index,
+                    x1, y1, x2, y2,
+                    tuple(resized.shape) if 'resized' in locals() else None,
+                    exc,
+                    exc_info=True,
+                )
             provenance[output_index] = blend_status
             cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), combined)
         return provenance
