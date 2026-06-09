@@ -218,10 +218,17 @@ class LipSyncRequest(BaseModel):
     target_fast_motion_gate_enabled: bool = True
     target_fast_motion_max_center_shift_per_frame: float = Field(0.35, ge=0.0, le=2.0)
     target_fast_motion_max_scale_change_per_frame: float = Field(0.20, ge=0.0, le=2.0)
-    target_fast_motion_min_run_frames: int = Field(1, ge=1, le=120)
+    target_fast_motion_min_run_frames: int = Field(2, ge=1, le=120)
     lipsync_continuity_max_gap_seconds: float = Field(0.80, ge=0.0, le=2.0)
     lipsync_continuity_max_center_shift: float = Field(0.65, ge=0.0, le=5.0)
     lipsync_continuity_max_scale_change: float = Field(0.55, ge=0.0, le=2.0)
+    # Independent knobs for the second-pass continuity fill so it
+    # does not silently inherit the initial gap-fill's window /
+    # match-ratio. The second pass runs after motion + fast-motion +
+    # mouth-diff filters, so it usually wants a slightly larger
+    # window and a lower match ratio to recover bridged segments.
+    lipsync_continuity_window_seconds: float = Field(2.0, ge=0.1, le=10.0)
+    lipsync_continuity_min_match_ratio: float = Field(0.40, ge=0.0, le=1.0)
     # Mouth-region pixel diff break: complementary to the embedding
     # similarity check. When the mouth region mean abs diff between
     # consecutive aligned face crops exceeds this fraction, treat the
@@ -255,9 +262,6 @@ class LipSyncRequest(BaseModel):
     mouth_sharpen_strength: float = Field(0.10, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
-    mouth_audio_adaptive_motion_enabled: bool = True
-    mouth_audio_motion_min_scale: float = Field(0.65, ge=0.0, le=2.0)
-    mouth_audio_motion_max_scale: float = Field(1.15, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default.
     # MuseTalk does not consume this field (encoder-decoder pipeline,
     # not diffusion inpainting); it is accepted for API compatibility
@@ -2149,7 +2153,12 @@ class MuseTalkApiRuntime:
                         "mouth_region_diff": diff,
                     }
                     filtered += 1
-                    prev_crop = None
+                    # Keep the break crop as the next reference instead
+                    # of resetting to None: a sustained face switch
+                    # (next frame also differs) is then caught by the
+                    # same check, avoiding a 1-3 frame blind window
+                    # where a real switch could pass undetected.
+                    prev_crop = crop
                     prev_index = index
                     continue
             prev_crop = crop
@@ -2289,13 +2298,14 @@ class MuseTalkApiRuntime:
         return latents_by_frame
 
     def _source_index_for_output(self, output_index: int, frame_count: int) -> int:
-        if frame_count <= 1:
+        # Output frame count is tied to source video length (see
+        # AGENTS.md), so this is a defensive identity mapping. The
+        # older bounce logic is dead code; keep the min() so a
+        # caller that overshoots frame_count clamps to the last
+        # source frame instead of raising.
+        if frame_count <= 0:
             return 0
-        cycle_length = frame_count * 2
-        cycle_index = output_index % cycle_length
-        if cycle_index < frame_count:
-            return cycle_index
-        return cycle_length - cycle_index - 1
+        return min(max(int(output_index), 0), frame_count - 1)
 
     @staticmethod
     def _resolve_audio_feature_fps(source_fps: float, payload: LipSyncRequest) -> float:
@@ -2505,8 +2515,22 @@ class MuseTalkApiRuntime:
 
         image_float = image.astype(np.float32)
         reference_float = reference.astype(np.float32)
-        image_mean, image_std = cv2.meanStdDev(image_float)
-        reference_mean, reference_std = cv2.meanStdDev(reference_float)
+        # Restrict the statistics to the upper face (y < 55% of the
+        # crop), which is the area outside the mouth ROI used by
+        # ``_mouth_region_diff`` (y 55-74%). Matching on the mouth
+        # itself would dim bright lip frames toward the source's
+        # neutral mouth color and reduce the lipsync contrast we
+        # are trying to preserve.
+        height = image_float.shape[0]
+        cutoff = int(height * 0.55)
+        if cutoff > 1 and cutoff < height - 1:
+            image_upper = image_float[:cutoff, :, :]
+            reference_upper = reference_float[:cutoff, :, :]
+        else:
+            image_upper = image_float
+            reference_upper = reference_float
+        image_mean, image_std = cv2.meanStdDev(image_upper)
+        reference_mean, reference_std = cv2.meanStdDev(reference_upper)
         image_mean = image_mean.reshape(1, 1, 3)
         image_std = image_std.reshape(1, 1, 3)
         reference_mean = reference_mean.reshape(1, 1, 3)
@@ -2580,10 +2604,26 @@ class MuseTalkApiRuntime:
         quality_min_laplacian: float,
         quality_min_sharpness_ratio: float,
         face_parser: Optional[FaceParsing],
-    ) -> int:
+    ) -> List[str]:
+        """Write every output frame to ``output_dir`` and return a
+        per-frame provenance list of length ``output_frame_count``.
+
+        Each entry is one of:
+          - ``"passthrough"``: source frame written unchanged (no
+            target, no inference result, blend material missing,
+            invalid crop, or speech-gate-silent).
+          - ``"quality_fallback"``: inference ran and was blended,
+            but the per-frame quality gate replaced it with the
+            source frame.
+          - ``"blend_error"``: inference ran but ``get_image_blending``
+            raised; the source frame was written as a defensive
+            fallback.
+          - ``"generated"``: the generated face crop was blended
+            into the source frame.
+        """
         output_dir.mkdir(parents=True, exist_ok=True)
         frame_count = len(frames)
-        quality_fallback_frames = 0
+        provenance: List[str] = ["passthrough"] * output_frame_count
         blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
         for output_index in _progress(
             range(output_frame_count),
@@ -2607,6 +2647,7 @@ class MuseTalkApiRuntime:
                 continue
 
             x1, y1, x2, y2 = crop_bbox
+            blend_status = "generated"
             try:
                 if source_index not in blend_materials:
                     try:
@@ -2640,7 +2681,7 @@ class MuseTalkApiRuntime:
                     quality_min_laplacian,
                     quality_min_sharpness_ratio,
                 ):
-                    quality_fallback_frames += 1
+                    blend_status = "quality_fallback"
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 mask_array, crop_box = material
@@ -2652,9 +2693,11 @@ class MuseTalkApiRuntime:
                     crop_box,
                 )
             except Exception:
+                blend_status = "blend_error"
                 combined = original_frame
+            provenance[output_index] = blend_status
             cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), combined)
-        return quality_fallback_frames
+        return provenance
 
     def _frames_to_video(self, frames_dir: Path, fps: float, temp_video_path: Path) -> None:
         subprocess.run(
@@ -2859,6 +2902,7 @@ class MuseTalkApiRuntime:
                     "quality_fallback_frames": 0,
                     "effective_generated_output_frames": 0,
                     "skipped_output_frames": len(frames),
+                    "frame_provenance": ["passthrough"] * len(frames),
                     "best_similarity": 0.0,
                     "target_identity_similarity": 0.0,
                     "target_identity_count": 0,
@@ -2900,10 +2944,6 @@ class MuseTalkApiRuntime:
                         "delta_max": 0.0,
                         "delta_skip_frames": 0,
                         "stabilized_frames": 0,
-                        "audio_adaptive_motion_enabled": bool(payload.mouth_audio_adaptive_motion_enabled),
-                        "audio_motion_min_scale": float(payload.mouth_audio_motion_min_scale),
-                        "audio_motion_median_scale": 1.0,
-                        "audio_motion_max_scale": float(payload.mouth_audio_motion_max_scale),
                     },
                     "codeformer": {
                         "requested": bool(payload.codeformer_enabled),
@@ -3001,8 +3041,8 @@ class MuseTalkApiRuntime:
                 fps,
                 frames[0].shape if frames else (0, 0, 3),
                 payload.lipsync_continuity_max_gap_seconds,
-                payload.target_fill_window_seconds,
-                payload.target_fill_min_match_ratio,
+                payload.lipsync_continuity_window_seconds,
+                payload.lipsync_continuity_min_match_ratio,
                 payload.lipsync_continuity_max_center_shift,
             )
             filtered_small_face_frames, filtered_short_segment_frames = self._filter_lipsync_targets(
@@ -3168,7 +3208,7 @@ class MuseTalkApiRuntime:
                 else None
             )
             render_dir = job_output_dir / "frames"
-            quality_fallback_frames = self._write_result_frames(
+            frame_provenance = self._write_result_frames(
                 frames,
                 targets,
                 generated,
@@ -3185,6 +3225,9 @@ class MuseTalkApiRuntime:
                 payload.quality_min_laplacian,
                 payload.quality_min_sharpness_ratio,
                 face_parser,
+            )
+            quality_fallback_frames = sum(
+                1 for status in frame_provenance if status == "quality_fallback"
             )
 
             temp_video_path = job_output_dir / "temp_video.mp4"
@@ -3223,6 +3266,11 @@ class MuseTalkApiRuntime:
                 "quality_fallback_frames": quality_fallback_frames,
                 "effective_generated_output_frames": max(0, len(generated) - quality_fallback_frames),
                 "skipped_output_frames": skipped_output_frames,
+                # Per-frame provenance: "passthrough" / "generated" /
+                # "quality_fallback" / "blend_error". Length always
+                # equals output_frame_count so callers can correlate
+                # it with frame indices and audio alignment.
+                "frame_provenance": frame_provenance,
                 "best_similarity": max(best_scores) if best_scores else 0.0,
                 "target_identity_similarity": target_identity_score,
                 "target_identity_count": target_identity_count,
@@ -3276,10 +3324,6 @@ class MuseTalkApiRuntime:
                     "delta_max": 0.0,
                     "delta_skip_frames": 0,
                     "stabilized_frames": 0,
-                    "audio_adaptive_motion_enabled": bool(payload.mouth_audio_adaptive_motion_enabled),
-                    "audio_motion_min_scale": float(payload.mouth_audio_motion_min_scale),
-                    "audio_motion_median_scale": 1.0,
-                    "audio_motion_max_scale": float(payload.mouth_audio_motion_max_scale),
                 },
                 "codeformer": codeformer_stats,
                 "quality_ok": True,
