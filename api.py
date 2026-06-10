@@ -2959,6 +2959,45 @@ class MuseTalkApiRuntime:
         sharpened = cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
         return np.clip(sharpened, 0, 255).astype(np.uint8)
 
+    def _fix_mouth_color_block(
+        self,
+        image: np.ndarray,
+        skin_mask: Optional[np.ndarray],
+    ) -> np.ndarray:
+        """Local color-block fix on the mouth region. MuseTalk's
+        per-tile color drift shows up as hard color blocks in the
+        mouth that the post-process masks cannot see (color match
+        is hard-cut to the upper face; reference detail restore is
+        gated to skin by the BiSeNet mask). The drift is a local
+        contrast / brightness imbalance within the mouth ROI, so
+        the right fix is a CLAHE-style local histogram equalization
+        on the luminance channel -- and it must be applied to the
+        mouth only, otherwise the surrounding skin tone would
+        shift.
+
+        Falls back to the input when the skin mask is missing or
+        the mouth area is too small (< 100 px) to make the
+        transform safe.
+        """
+        if skin_mask is None or image.size == 0:
+            return image
+        if skin_mask.shape != image.shape[:2]:
+            return image
+        mouth_mask = (skin_mask < 128).astype(np.uint8)
+        if int(mouth_mask.sum()) < 100:
+            return image
+        ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        ycrcb[..., 0] = clahe.apply(ycrcb[..., 0])
+        equalized = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
+        mouth_mask_f = mouth_mask.astype(np.float32) / 255.0
+        mouth_mask_3 = mouth_mask_f[:, :, None]
+        blended = (
+            image.astype(np.float32) * (1.0 - mouth_mask_3)
+            + equalized.astype(np.float32) * mouth_mask_3
+        )
+        return np.clip(blended, 0, 255).astype(np.uint8)
+
     def _restore_reference_detail(
         self,
         image: np.ndarray,
@@ -3318,6 +3357,12 @@ class MuseTalkApiRuntime:
                 resized = self._restore_reference_detail(
                     resized, reference_crop, mouth_detail_strength, skin_mask=skin_mask
                 )
+                # Local color-block fix on the mouth. Done after
+                # detail restore so the per-tile drift in the
+                # generated open-mouth area is the only thing the
+                # equalizer sees -- skin and other regions are
+                # left alone.
+                resized = self._fix_mouth_color_block(resized, skin_mask)
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
                 # Output-level temporal blend. After all post-
                 # processing, mix the current face crop with the
