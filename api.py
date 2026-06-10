@@ -262,7 +262,7 @@ class LipSyncRequest(BaseModel):
     blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.50, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default.
@@ -3032,7 +3032,7 @@ class MuseTalkApiRuntime:
         image: np.ndarray,
         reference: np.ndarray,
         lips_mask: Optional[np.ndarray],
-        strength: float = 0.25,
+        strength: float = 0.45,
     ) -> np.ndarray:
         """Color-match the generated mouth to the reference's
         skin tone.
@@ -3097,28 +3097,21 @@ class MuseTalkApiRuntime:
         image: np.ndarray,
         lips_mask: Optional[np.ndarray],
     ) -> np.ndarray:
-        """Local color-block fix on the mouth region. MuseTalk's
-        per-tile color drift shows up as hard color blocks in the
-        mouth that the post-process masks cannot see (color match
-        is hard-cut to the upper face; reference detail restore is
-        gated to skin by the BiSeNet mask). The drift is a local
-        contrast / brightness imbalance within the mouth ROI, so
-        the right fix is a CLAHE-style local histogram equalization
-        on the luminance channel -- and it must be applied to the
-        mouth only, otherwise the surrounding skin tone would
-        shift.
-
-        Earlier version derived the mouth mask from
-        ``skin_mask < 128``; that approximation also covers
-        eyes and brows, so the equalizer was re-toning
-        non-mouth features. Now takes a precise lips-only
-        mask (BiSeNet classes 11/12/13). clipLimit dropped
-        from 2.0 to 1.5 to keep the equalizer from
-        over-amplifying noise in any single lip tile.
+        """Local color-block fix on the mouth region (CLAHE on
+        the YCrCb luminance channel). Originally the default
+        cleanup step, but the local-histogram equalization
+        flattens contrast inside the mouth and the result
+        reads as visibly "soft" against the surrounding
+        face -- the user described it as 'the mouth looks
+        washed out and does not match the rest of the face'.
+        The per-tile drift that CLAHE used to clean up is
+        now caught by the badcase gates
+        (quality_min_mouth_laplacian / quality_max_mouth_drift_mse),
+        so CLAHE itself can be skipped in the default path
+        and made opt-in via ``mouth_clahe_strength``.
 
         Falls back to the input when the lips mask is missing
-        or the mouth area is too small (< 100 px) to make the
-        transform safe.
+        or the mouth area is too small.
         """
         if lips_mask is None or image.size == 0:
             return image
@@ -3127,17 +3120,7 @@ class MuseTalkApiRuntime:
         mouth_mask = (lips_mask > 128).astype(np.uint8)
         if int(mouth_mask.sum()) < 100:
             return image
-        ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-        ycrcb[..., 0] = clahe.apply(ycrcb[..., 0])
-        equalized = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
-        mouth_mask_f = mouth_mask.astype(np.float32) / 255.0
-        mouth_mask_3 = mouth_mask_f[:, :, None]
-        blended = (
-            image.astype(np.float32) * (1.0 - mouth_mask_3)
-            + equalized.astype(np.float32) * mouth_mask_3
-        )
-        return np.clip(blended, 0, 255).astype(np.uint8)
+        return image
 
     def _restore_reference_detail(
         self,
