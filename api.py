@@ -4594,8 +4594,8 @@ def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str,
 
 @app.post("/api/lipsync")
 def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, object]:
-    if payload.parsing_mode not in {"jaw", "raw"}:
-        raise HTTPException(status_code=400, detail="parsing_mode must be 'jaw' or 'raw'")
+    if payload.parsing_mode not in {"jaw", "raw", "lips_only"}:
+        raise HTTPException(status_code=400, detail="parsing_mode must be 'jaw', 'raw', or 'lips_only'")
 
     job_id = uuid.uuid4().hex
     job_input_dir = INPUT_ROOT / job_id
