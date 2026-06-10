@@ -3042,10 +3042,10 @@ class MuseTalkApiRuntime:
         the open mouth toward the closed-mouth skin tone and
         also picked up eyes / brows. Now targets the
         reference's skin tone (the closest the source
-        subject's true complexion), but uses the precise
-        lips-only mask and a lighter 0.25 strength so the
-        open-mouth shape does not collapse into the
-        closed-mouth reference.
+        subject's true complexion), using the precise
+        lips-only mask and a default 0.45 strength, exposed
+        as a Pydantic knob (mouth_color_match_strength) so
+        callers can relax or strengthen it per request.
         """
         if strength <= 0.0 or image.size == 0 or reference.size == 0:
             return image
@@ -3339,6 +3339,7 @@ class MuseTalkApiRuntime:
         blend_mask_blur_ratio: float,
         color_match_strength: float,
         mouth_detail_strength: float,
+        mouth_color_match_strength: float,
         mouth_sharpen_strength: float,
         output_temporal_blend: float,
         quality_gate_enabled: bool,
@@ -3485,7 +3486,8 @@ class MuseTalkApiRuntime:
                 # contrast imbalance) is what CLAHE cleans up
                 # next.
                 resized = self._match_mouth_to_skin_tone(
-                    resized, reference_crop, lips_mask
+                    resized, reference_crop, lips_mask,
+                    strength=mouth_color_match_strength,
                 )
                 resized = self._restore_reference_detail(
                     resized, reference_crop, mouth_detail_strength, skin_mask=skin_mask
@@ -4296,6 +4298,7 @@ class MuseTalkApiRuntime:
                 payload.blend_mask_blur_ratio,
                 payload.color_match_strength,
                 payload.mouth_detail_strength,
+                payload.mouth_color_match_strength,
                 payload.mouth_sharpen_strength,
                 payload.output_temporal_blend,
                 payload.quality_gate_enabled,
