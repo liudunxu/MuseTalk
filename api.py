@@ -3397,6 +3397,15 @@ class MuseTalkApiRuntime:
         output_dir.mkdir(parents=True, exist_ok=True)
         frame_count = len(frames)
         provenance: List[str] = ["passthrough"] * output_frame_count
+        png_write_params = [cv2.IMWRITE_PNG_COMPRESSION, 1]
+
+        def write_frame(output_index: int, frame: np.ndarray) -> None:
+            cv2.imwrite(
+                str(output_dir / f"{output_index:08d}.png"),
+                frame,
+                png_write_params,
+            )
+
         blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
         skin_masks: Dict[int, Optional[np.ndarray]] = {}
         lips_masks: Dict[int, Optional[np.ndarray]] = {}
@@ -3431,12 +3440,12 @@ class MuseTalkApiRuntime:
             result_frame = generated.get(output_index)
 
             if bbox is None or result_frame is None or face_parser is None:
-                cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                write_frame(output_index, original_frame)
                 continue
 
             crop_bbox = self._bbox_with_margin(bbox, original_frame, extra_margin)
             if crop_bbox is None:
-                cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                write_frame(output_index, original_frame)
                 continue
 
             x1, y1, x2, y2 = crop_bbox
@@ -3470,7 +3479,7 @@ class MuseTalkApiRuntime:
                         blend_materials[source_index] = None
                 material = blend_materials[source_index]
                 if material is None:
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 resized = cv2.resize(
                     result_frame.astype(np.uint8),
@@ -3583,7 +3592,7 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 # Drift fallback. Compares the post-processed face
                 # crop to the reference on the area OUTSIDE the
@@ -3602,7 +3611,7 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 if (
                     quality_max_face_tile_mse > 0.0
@@ -3611,7 +3620,7 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 # Mouth-region postfilter. Catches a single large
                 # blurry patch in the generated mouth (CodeFormer
@@ -3625,7 +3634,7 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 if quality_gate_enabled and self._is_low_quality_generation(
                     resized,
@@ -3635,7 +3644,7 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 # --- Optional badcase gates (lips / skin drift) ---
                 # These four gates answer "did the pipeline
@@ -3654,7 +3663,7 @@ class MuseTalkApiRuntime:
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
                     fallback_reasons["mouth_laplacian"] += 1
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 if (
                     lips_mask is not None
@@ -3665,7 +3674,7 @@ class MuseTalkApiRuntime:
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
                     fallback_reasons["mouth_drift_mse"] += 1
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 if (
                     skin_mask is not None
@@ -3676,7 +3685,7 @@ class MuseTalkApiRuntime:
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
                     fallback_reasons["skin_drift_mse"] += 1
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 if (
                     skin_mask is not None
@@ -3687,7 +3696,7 @@ class MuseTalkApiRuntime:
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
                     fallback_reasons["skin_laplacian"] += 1
-                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    write_frame(output_index, original_frame)
                     continue
                 if len(material) == 3:
                     mask_array, crop_box, aux = material
@@ -3756,7 +3765,7 @@ class MuseTalkApiRuntime:
                     exc_info=True,
                 )
             provenance[output_index] = blend_status
-            cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), combined)
+            write_frame(output_index, combined)
         return provenance, fallback_reasons
 
     def _frames_to_video(self, frames_dir: Path, fps: float, temp_video_path: Path) -> None:

@@ -94,11 +94,43 @@ def get_image(image, face, face_box, upper_boundary_ratio=0.5, expand=1.5, mode=
 
 
 def get_image_blending(image, face, face_box, mask_array, crop_box):
+    x, y, x1, y1 = face_box
+    x_s, y_s, x_e, y_e = crop_box
+    height, width = image.shape[:2]
+    crop_w = x_e - x_s
+    crop_h = y_e - y_s
+    if (
+        0 <= x_s < x_e <= width
+        and 0 <= y_s < y_e <= height
+        and mask_array.shape[:2] == (crop_h, crop_w)
+        and face.shape[:2] == (y1 - y, x1 - x)
+    ):
+        face_offset_x = x - x_s
+        face_offset_y = y - y_s
+        if (
+            0 <= face_offset_x
+            and 0 <= face_offset_y
+            and face_offset_x + face.shape[1] <= crop_w
+            and face_offset_y + face.shape[0] <= crop_h
+        ):
+            face_large = image[y_s:y_e, x_s:x_e].copy()
+            face_large[
+                face_offset_y:face_offset_y + face.shape[0],
+                face_offset_x:face_offset_x + face.shape[1],
+            ] = face
+            alpha = mask_array.astype(np.float32) / 255.0
+            if alpha.ndim == 2:
+                alpha = alpha[:, :, None]
+            body = image.copy()
+            body[y_s:y_e, x_s:x_e] = (
+                face_large.astype(np.float32) * alpha
+                + body[y_s:y_e, x_s:x_e].astype(np.float32) * (1.0 - alpha)
+            ).astype(np.uint8)
+            return body
+
     body = Image.fromarray(image[:,:,::-1])
     face = Image.fromarray(face[:,:,::-1])
 
-    x, y, x1, y1 = face_box
-    x_s, y_s, x_e, y_e = crop_box
     face_large = body.crop(crop_box)
 
     mask_image = Image.fromarray(mask_array)
