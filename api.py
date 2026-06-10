@@ -3031,8 +3031,8 @@ class MuseTalkApiRuntime:
         self,
         image: np.ndarray,
         reference: np.ndarray,
-        skin_mask: Optional[np.ndarray],
-        strength: float = 0.40,
+        lips_mask: Optional[np.ndarray],
+        strength: float = 0.25,
     ) -> np.ndarray:
         """Color-match the generated mouth to the reference's
         skin tone.
@@ -3048,34 +3048,42 @@ class MuseTalkApiRuntime:
         and CLAHE only equalizes local contrast, not global
         brightness / temperature.
 
-        Pull the generated mouth's per-channel mean and std
-        toward the reference's *skin* mean / std (the source
-        subject's true skin tone, not the mouth itself, which
-        is closed in the reference and would over-tint the
-        generated open mouth). Apply only inside the mouth
-        region (skin_mask < 128) so the surrounding skin is
-        untouched.
+        Earlier version used ``skin_mask < 128`` as the
+        "mouth" region (and the reference's *skin* pixels
+        as the target) at strength 0.40. That over-tinted
+        the open mouth toward the closed-mouth skin tone and
+        also picked up eyes / brows. Now targets the
+        reference's skin tone (the closest the source
+        subject's true complexion), but uses the precise
+        lips-only mask and a lighter 0.25 strength so the
+        open-mouth shape does not collapse into the
+        closed-mouth reference.
         """
         if strength <= 0.0 or image.size == 0 or reference.size == 0:
             return image
         if image.shape != reference.shape:
             return image
-        if skin_mask is None or skin_mask.shape != image.shape[:2]:
+        if lips_mask is None or lips_mask.shape != image.shape[:2]:
             return image
-        ref_skin_pixels = reference[skin_mask > 128]
-        if ref_skin_pixels.size == 0 or ref_skin_pixels.shape[0] < 100:
-            return image
-        ref_mean = ref_skin_pixels.mean(axis=0)
-        ref_std = ref_skin_pixels.std(axis=0)
-        mouth_mask = (skin_mask < 128)
+        # Reference skin tone comes from the *reference's*
+        # skin mask. lips_mask is the generated lips mask
+        # only; the matching reference region for "skin
+        # tone" is the reference's own skin (which we
+        # approximate by inverting the reference's own lips
+        # signal -- but we only have the source's lips
+        # mask, not the reference's, so we use the same
+        # mask as a "non-lips" region inside the face crop).
+        mouth_mask = (lips_mask > 128)
         if int(mouth_mask.sum()) < 100:
             return image
+        ref_non_mouth = reference[~mouth_mask]
+        if ref_non_mouth.size == 0 or ref_non_mouth.shape[0] < 100:
+            return image
+        ref_mean = ref_non_mouth.mean(axis=0)
+        ref_std = ref_non_mouth.std(axis=0)
         gen_mouth_pixels = image[mouth_mask]
         gen_mean = gen_mouth_pixels.mean(axis=0)
         gen_std = gen_mouth_pixels.std(axis=0)
-        # Per-channel scale + shift that maps gen_mouth's
-        # distribution to ref_skin's. Strength blends: 0 keeps
-        # gen, 1 fully matches.
         scale = ref_std / np.maximum(gen_std, 1.0)
         shift = ref_mean - gen_mean * scale
         image_float = image.astype(np.float32)
@@ -3087,7 +3095,7 @@ class MuseTalkApiRuntime:
     def _fix_mouth_color_block(
         self,
         image: np.ndarray,
-        skin_mask: Optional[np.ndarray],
+        lips_mask: Optional[np.ndarray],
     ) -> np.ndarray:
         """Local color-block fix on the mouth region. MuseTalk's
         per-tile color drift shows up as hard color blocks in the
@@ -3100,19 +3108,27 @@ class MuseTalkApiRuntime:
         mouth only, otherwise the surrounding skin tone would
         shift.
 
-        Falls back to the input when the skin mask is missing or
-        the mouth area is too small (< 100 px) to make the
+        Earlier version derived the mouth mask from
+        ``skin_mask < 128``; that approximation also covers
+        eyes and brows, so the equalizer was re-toning
+        non-mouth features. Now takes a precise lips-only
+        mask (BiSeNet classes 11/12/13). clipLimit dropped
+        from 2.0 to 1.5 to keep the equalizer from
+        over-amplifying noise in any single lip tile.
+
+        Falls back to the input when the lips mask is missing
+        or the mouth area is too small (< 100 px) to make the
         transform safe.
         """
-        if skin_mask is None or image.size == 0:
+        if lips_mask is None or image.size == 0:
             return image
-        if skin_mask.shape != image.shape[:2]:
+        if lips_mask.shape != image.shape[:2]:
             return image
-        mouth_mask = (skin_mask < 128).astype(np.uint8)
+        mouth_mask = (lips_mask > 128).astype(np.uint8)
         if int(mouth_mask.sum()) < 100:
             return image
         ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
         ycrcb[..., 0] = clahe.apply(ycrcb[..., 0])
         equalized = cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2BGR)
         mouth_mask_f = mouth_mask.astype(np.float32) / 255.0
@@ -3425,7 +3441,7 @@ class MuseTalkApiRuntime:
         quality_max_skin_drift_mse: float,
         quality_min_skin_laplacian: float,
         face_parser: Optional[FaceParsing],
-    ) -> List[str]:
+    ) -> Tuple[List[str], Dict[str, int]]:
         """Write every output frame to ``output_dir`` and return a
         per-frame provenance list of length ``output_frame_count``.
 
@@ -3448,6 +3464,16 @@ class MuseTalkApiRuntime:
         blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
         skin_masks: Dict[int, Optional[np.ndarray]] = {}
         lips_masks: Dict[int, Optional[np.ndarray]] = {}
+        # Per-gate fallback counters. Reported back so the
+        # [LipSync-report] log line shows which badcase
+        # classification fired how many times.
+        fallback_reasons: Dict[str, int] = {
+            "mouth_laplacian": 0,
+            "mouth_drift_mse": 0,
+            "skin_drift_mse": 0,
+            "skin_laplacian": 0,
+            "other": 0,
+        }
         previous_resized: Optional[np.ndarray] = None
         for output_index in _progress(
             range(output_frame_count),
@@ -3547,7 +3573,7 @@ class MuseTalkApiRuntime:
                 # contrast imbalance) is what CLAHE cleans up
                 # next.
                 resized = self._match_mouth_to_skin_tone(
-                    resized, reference_crop, skin_mask
+                    resized, reference_crop, lips_mask
                 )
                 resized = self._restore_reference_detail(
                     resized, reference_crop, mouth_detail_strength, skin_mask=skin_mask
@@ -3557,7 +3583,7 @@ class MuseTalkApiRuntime:
                 # generated open-mouth area is the only thing the
                 # equalizer sees -- skin and other regions are
                 # left alone.
-                resized = self._fix_mouth_color_block(resized, skin_mask)
+                resized = self._fix_mouth_color_block(resized, lips_mask)
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
                 # Output-level temporal blend. After all post-
                 # processing, mix the current face crop with the
@@ -3668,6 +3694,7 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
+                    fallback_reasons["mouth_laplacian"] += 1
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 if (
@@ -3678,6 +3705,7 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
+                    fallback_reasons["mouth_drift_mse"] += 1
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 if (
@@ -3688,6 +3716,7 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
+                    fallback_reasons["skin_drift_mse"] += 1
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 if (
@@ -3698,14 +3727,29 @@ class MuseTalkApiRuntime:
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
+                    fallback_reasons["skin_laplacian"] += 1
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 mask_array, crop_box = material
+                # Use the lips-only mask for the final paste
+                # so a MuseTalk / CodeFormer failure cannot
+                # bleed into the cheeks / forehead / hair. The
+                # jaw mask (skin + lips) lets the inpainter
+                # output reach every face pixel; the lips-only
+                # mask confines it to the actual mouth region
+                # so the rest of the face is bit-for-bit the
+                # source frame. Falls back to the jaw mask if
+                # lips_mask is unavailable for this source
+                # frame.
+                if lips_mask is not None and (lips_mask > 128).sum() > 16:
+                    blend_mask_for_paste = lips_mask
+                else:
+                    blend_mask_for_paste = mask_array
                 combined = get_image_blending(
                     original_frame,
                     resized,
                     [x1, y1, x2, y2],
-                    mask_array,
+                    blend_mask_for_paste,
                     crop_box,
                 )
             except Exception as exc:
@@ -3723,7 +3767,7 @@ class MuseTalkApiRuntime:
                 )
             provenance[output_index] = blend_status
             cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), combined)
-        return provenance
+        return provenance, fallback_reasons
 
     def _frames_to_video(self, frames_dir: Path, fps: float, temp_video_path: Path) -> None:
         subprocess.run(
@@ -4317,7 +4361,7 @@ class MuseTalkApiRuntime:
                 else None
             )
             render_dir = job_output_dir / "frames"
-            frame_provenance = self._write_result_frames(
+            frame_provenance, fallback_reasons = self._write_result_frames(
                 frames,
                 targets,
                 generated,
@@ -4384,6 +4428,7 @@ class MuseTalkApiRuntime:
                 "eligible_source_frames": eligible_source_frames,
                 "generated_output_frames": len(generated),
                 "quality_fallback_frames": quality_fallback_frames,
+                "quality_fallback_reasons": fallback_reasons,
                 "effective_generated_output_frames": max(0, len(generated) - quality_fallback_frames),
                 "skipped_output_frames": skipped_output_frames,
                 # Per-frame provenance: "passthrough" / "generated" /
@@ -4485,6 +4530,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         prov_counts[status] = prov_counts.get(status, 0) + 1
     speech_gate = result.get("speech_gate") or {}
     codeformer = result.get("codeformer") or {}
+    fallback_reasons = result.get("quality_fallback_reasons") or {}
     gen = int(result.get("generated_output_frames", 0))
     qf = int(result.get("quality_fallback_frames", 0))
     be = prov_counts["blend_error"]
@@ -4496,6 +4542,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         "  target: matched=%d filled_init=%d continuity_filled=%d smoothed=%d eligible=%d prefiltered_blur=%d prefiltered_side=%d\n"
         "  filtered: motion=%d fast_motion=%d mouth_diff=%d small_face=%d short_segment=%d\n"
         "  generated: gen=%d quality_fallback=%d passthrough=%d blend_error=%d blended=%d\n"
+        "  fallback_reasons: mouth_laplacian=%d mouth_drift_mse=%d skin_drift_mse=%d skin_laplacian=%d other=%d\n"
         "  identity_sim: min/med/max=%.3f/%.3f/%.3f\n"
         "  speech_gate: enabled=%s active=%s\n"
         "  codeformer: enabled=%s available=%s",
@@ -4526,6 +4573,11 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         prov_counts["passthrough"],
         prov_counts["blend_error"],
         effective_blended,
+        int(fallback_reasons.get("mouth_laplacian", 0)),
+        int(fallback_reasons.get("mouth_drift_mse", 0)),
+        int(fallback_reasons.get("skin_drift_mse", 0)),
+        int(fallback_reasons.get("skin_laplacian", 0)),
+        int(fallback_reasons.get("other", 0)),
         float(result.get("identity_similarity_min", 0.0)),
         float(result.get("identity_similarity_median", 0.0)),
         float(result.get("identity_similarity_max", 0.0)),
