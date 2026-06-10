@@ -261,6 +261,7 @@ class LipSyncRequest(BaseModel):
     blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
+    mouth_color_match_strength: float = Field(0.45, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.50, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
