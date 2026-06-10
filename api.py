@@ -3029,6 +3029,7 @@ class MuseTalkApiRuntime:
         image: np.ndarray,
         reference: np.ndarray,
         lips_mask: Optional[np.ndarray],
+        skin_mask: Optional[np.ndarray] = None,
         strength: float = 0.45,
     ) -> np.ndarray:
         """Color-match the generated mouth to the reference's
@@ -3052,7 +3053,7 @@ class MuseTalkApiRuntime:
         also picked up eyes / brows. Now targets the
         reference's skin tone (the closest the source
         subject's true complexion), using the precise
-        lips-only mask and a default 0.45 strength, exposed
+        lips-only mask and a default 0.30 strength, exposed
         as a Pydantic knob (mouth_color_match_strength) so
         callers can relax or strengthen it per request.
         """
@@ -3062,22 +3063,26 @@ class MuseTalkApiRuntime:
             return image
         if lips_mask is None or lips_mask.shape != image.shape[:2]:
             return image
-        # Reference skin tone comes from the *reference's*
-        # skin mask. lips_mask is the generated lips mask
-        # only; the matching reference region for "skin
-        # tone" is the reference's own skin (which we
-        # approximate by inverting the reference's own lips
-        # signal -- but we only have the source's lips
-        # mask, not the reference's, so we use the same
-        # mask as a "non-lips" region inside the face crop).
+        # Reference skin tone should come from actual source
+        # skin pixels when the parser provides them. Falling
+        # back to non-mouth pixels is useful for legacy callers,
+        # but it can include eyes, brows, hair, background, or
+        # shadows and pull lips toward gray.
         mouth_mask = (lips_mask > 128)
         if int(mouth_mask.sum()) < 100:
             return image
-        ref_non_mouth = reference[~mouth_mask]
-        if ref_non_mouth.size == 0 or ref_non_mouth.shape[0] < 100:
+        reference_mask = None
+        if skin_mask is not None and skin_mask.shape == image.shape[:2]:
+            skin_reference_mask = (skin_mask > 128) & ~mouth_mask
+            if int(skin_reference_mask.sum()) >= 100:
+                reference_mask = skin_reference_mask
+        if reference_mask is None:
+            reference_mask = ~mouth_mask
+        ref_pixels = reference[reference_mask]
+        if ref_pixels.size == 0 or ref_pixels.shape[0] < 100:
             return image
-        ref_mean = ref_non_mouth.mean(axis=0)
-        ref_std = ref_non_mouth.std(axis=0)
+        ref_mean = ref_pixels.mean(axis=0)
+        ref_std = ref_pixels.std(axis=0)
         gen_mouth_pixels = image[mouth_mask]
         gen_mean = gen_mouth_pixels.mean(axis=0)
         gen_std = gen_mouth_pixels.std(axis=0)
@@ -3085,7 +3090,13 @@ class MuseTalkApiRuntime:
         shift = ref_mean - gen_mean * scale
         image_float = image.astype(np.float32)
         out = image_float * (1.0 - strength + strength * scale) + strength * shift
-        mouth_mask_3 = mouth_mask[:, :, None].astype(np.float32)
+        mouth_mask_f = cv2.GaussianBlur(
+            lips_mask.astype(np.float32) / 255.0,
+            (0, 0),
+            1.0,
+        )
+        mouth_mask_f = np.clip(mouth_mask_f, 0.0, 1.0)
+        mouth_mask_3 = mouth_mask_f[:, :, None]
         result = image_float * (1.0 - mouth_mask_3) + out * mouth_mask_3
         result_u8 = np.clip(result, 0, 255).astype(np.uint8)
 
@@ -3421,10 +3432,9 @@ class MuseTalkApiRuntime:
         }
         previous_resized: Optional[np.ndarray] = None
         # Track the source_index that produced ``previous_resized``
-        # so the temporal blend skips the cross-source edge. When
-        # ``_source_index_for_output`` jumps (audio-driven speed
-        # changes, retiming) the face crop is from a different
-        # source frame and ``previous_resized`` is stale -- mixing
+        # so the temporal blend only crosses adjacent source
+        # frames. Larger jumps (audio-driven speed changes,
+        # retiming) mean ``previous_resized`` is stale -- mixing
         # it into the new crop would smear unrelated content.
         previous_source_index: Optional[int] = None
         for output_index in _progress(
@@ -3544,6 +3554,7 @@ class MuseTalkApiRuntime:
                 # next.
                 resized = self._match_mouth_to_skin_tone(
                     resized, reference_crop, lips_mask,
+                    skin_mask=skin_mask,
                     strength=mouth_color_match_strength,
                 )
                 resized = self._restore_reference_detail(
@@ -3563,16 +3574,27 @@ class MuseTalkApiRuntime:
                 if (
                     output_temporal_blend > 0.0
                     and previous_resized is not None
-                    and previous_source_index == source_index
+                    and previous_source_index is not None
+                    and source_index - previous_source_index in (0, 1)
                     and previous_resized.shape == resized.shape
                 ):
-                    resized = cv2.addWeighted(
-                        resized,
-                        1.0 - output_temporal_blend,
-                        previous_resized,
-                        output_temporal_blend,
-                        0,
-                    )
+                    temporal_ok = True
+                    if lips_mask is not None and lips_mask.shape == resized.shape[:2]:
+                        mouth_sel = lips_mask > 128
+                        if int(mouth_sel.sum()) >= 16:
+                            mouth_delta = np.abs(
+                                resized.astype(np.float32)
+                                - previous_resized.astype(np.float32)
+                            )[mouth_sel].mean() / 255.0
+                            temporal_ok = mouth_delta <= 0.16
+                    if temporal_ok:
+                        resized = cv2.addWeighted(
+                            resized,
+                            1.0 - output_temporal_blend,
+                            previous_resized,
+                            output_temporal_blend,
+                            0,
+                        )
                 previous_resized = resized
                 previous_source_index = source_index
                 # Light color-block check. Compares the upper-face
