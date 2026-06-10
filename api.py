@@ -356,15 +356,19 @@ class LipSyncRequest(BaseModel):
     # Localized color-block fallback. Divides the face crop into
     # tiles (default 32x32) and computes per-tile MSE vs the
     # reference. If any single tile exceeds this threshold, the
-    # frame falls back to source. 0 disables (default). Same
-    # coarse-metric caveat as the mean-MSE drift check above:
-    # opt in only if the soft-transition fixes do not eliminate
-    # the color bands on their own.
+    # frame falls back to source. 0 disables. Default 500 catches
+    # a single hard color block in any 32x32 tile (most color
+    # blocks register in the 1000-3000 range on this metric)
+    # while tolerating normal per-tile lip-motion variation
+    # (typically 100-400). Set to 0 to disable, or 200-300 for
+    # stricter behavior. Compensates for the upper-face-only
+    # color histogram check, which cannot see color blocks in
+    # the mouth region.
     quality_max_face_tile_mse: float = Field(
-        0.0,
+        500.0,
         ge=0.0,
         le=10000.0,
-        description="Per-tile MSE ceiling on the face crop. 0 (default) disables.",
+        description="Per-tile MSE ceiling on the face crop. Default 500 catches single hard color blocks. 0 disables.",
     )
     # Source-face motion-blur prefilter. Catches frames where the
     # detected face is too blurry (camera motion, fast head turn)
