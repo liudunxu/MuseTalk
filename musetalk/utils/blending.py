@@ -173,10 +173,18 @@ def get_image_prepare_material(
     else:
         parsing = fp.parse_classes(face_large)
         aux = {
-            aux_mode: fp._build_mode_mask(parsing, aux_mode)
+            aux_mode: cv2.resize(
+                fp._build_mode_mask(parsing, aux_mode),
+                ori_shape,
+                interpolation=cv2.INTER_NEAREST,
+            )
             for aux_mode in aux_modes
         }
-        primary = fp._build_mode_mask(parsing, mode)
+        primary = cv2.resize(
+            fp._build_mode_mask(parsing, mode),
+            ori_shape,
+            interpolation=cv2.INTER_NEAREST,
+        )
         mask_image = Image.fromarray(primary)
 
     mask_small = mask_image.crop((x-x_s, y-y_s, x1-x_s, y1-y_s))

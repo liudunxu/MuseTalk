@@ -3672,13 +3672,14 @@ class MuseTalkApiRuntime:
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 if len(material) == 3:
-                    mask_array, crop_box, _aux = material
+                    mask_array, crop_box, aux = material
                 else:
                     # Legacy 2-tuple (pre-parser-merge) -- only
                     # happens if a hot-reload is in flight; the
                     # extra parser forward is wasted but the
                     # pipeline still works.
                     mask_array, crop_box = material[0], material[1]
+                    aux = {}
                 # Use the lips-only mask for the final paste
                 # so a MuseTalk / CodeFormer failure cannot
                 # bleed into the cheeks / forehead / hair. The
@@ -3687,26 +3688,32 @@ class MuseTalkApiRuntime:
                 # mask confines it to the actual mouth region
                 # so the rest of the face is bit-for-bit the
                 # source frame. Falls back to the jaw mask if
-                # lips_mask is unavailable for this source
+                # the expanded-crop lips mask is unavailable for this source
                 # frame.
                 #
                 # IMPORTANT: get_image_blending expects the
                 # mask to match the expanded ``face_large``
-                # crop size (crop_box), not the smaller
-                # face-crop size that the lips_mask was
-                # originally cached at. Resize with NEAREST so
-                # the 0/255 boundary stays sharp and does not
-                # leak into the cheeks.
-                if lips_mask is not None and (lips_mask > 128).sum() > 16:
-                    target_h = crop_box[3] - crop_box[1]
-                    target_w = crop_box[2] - crop_box[0]
-                    if lips_mask.shape == (target_h, target_w):
-                        blend_mask_for_paste = lips_mask
-                    else:
-                        blend_mask_for_paste = cv2.resize(
-                            lips_mask,
-                            (target_w, target_h),
-                            interpolation=cv2.INTER_NEAREST,
+                # crop size (crop_box). Use the parser's
+                # expanded-crop lips mask directly; resizing the
+                # smaller face-crop mask up to crop_box creates a
+                # visibly round paste boundary around the mouth.
+                lips_paste_mask = aux.get("lips_only") if aux else None
+                if lips_paste_mask is not None and (lips_paste_mask > 128).sum() > 16:
+                    blend_mask_for_paste = lips_paste_mask.copy()
+                    if lips_blend_dilation > 0:
+                        k = 2 * lips_blend_dilation + 1
+                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+                        blend_mask_for_paste = cv2.dilate(
+                            blend_mask_for_paste, kernel, iterations=1
+                        )
+                    if blend_mask_blur_ratio > 0:
+                        blur_kernel_size = (
+                            int(blend_mask_blur_ratio * blend_mask_for_paste.shape[0] // 2 * 2) + 1
+                        )
+                        blend_mask_for_paste = cv2.GaussianBlur(
+                            blend_mask_for_paste,
+                            (blur_kernel_size, blur_kernel_size),
+                            0,
                         )
                 else:
                     blend_mask_for_paste = mask_array
