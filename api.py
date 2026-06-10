@@ -222,7 +222,6 @@ class LipSyncRequest(BaseModel):
     target_fast_motion_min_run_frames: int = Field(2, ge=1, le=120)
     lipsync_continuity_max_gap_seconds: float = Field(1.20, ge=0.0, le=2.0)
     lipsync_continuity_max_center_shift: float = Field(1.00, ge=0.0, le=5.0)
-    lipsync_continuity_max_scale_change: float = Field(0.70, ge=0.0, le=2.0)
     # Independent knobs for the second-pass continuity fill so it
     # does not silently inherit the initial gap-fill's window /
     # match-ratio. The second pass runs after motion + fast-motion +
@@ -279,18 +278,6 @@ class LipSyncRequest(BaseModel):
     quality_gate_enabled: bool = False
     quality_min_laplacian: float = Field(0.02, ge=0.0, le=2000.0)
     quality_min_sharpness_ratio: float = Field(0.03, ge=0.0, le=1.0)
-    quality_ref_min_laplacian: float = Field(
-        0.50,
-        ge=0.0,
-        le=2000.0,
-        description="Only apply generated/reference sharpness-ratio fallback when the source mouth ROI is at least this sharp.",
-    )
-    quality_max_fallback_ratio: float = Field(
-        0.80,
-        ge=0.0,
-        le=1.0,
-        description="Disable quality fallback for this run if it would skip more than this fraction of non-prefiltered frames.",
-    )
     # Mouth sharpness floor. Catches the "mouth is completely
     # smudged" badcase (CodeFormer / MuseTalk / VAE failure):
     # the lips come out as a single low-variance blob. Default
@@ -3092,36 +3079,6 @@ class MuseTalkApiRuntime:
         result = image_float * (1.0 - mouth_mask_3) + out * mouth_mask_3
         return np.clip(result, 0, 255).astype(np.uint8)
 
-    def _fix_mouth_color_block(
-        self,
-        image: np.ndarray,
-        lips_mask: Optional[np.ndarray],
-    ) -> np.ndarray:
-        """Local color-block fix on the mouth region (CLAHE on
-        the YCrCb luminance channel). Originally the default
-        cleanup step, but the local-histogram equalization
-        flattens contrast inside the mouth and the result
-        reads as visibly "soft" against the surrounding
-        face -- the user described it as 'the mouth looks
-        washed out and does not match the rest of the face'.
-        The per-tile drift that CLAHE used to clean up is
-        now caught by the badcase gates
-        (quality_min_mouth_laplacian / quality_max_mouth_drift_mse),
-        so CLAHE itself can be skipped in the default path
-        and made opt-in via ``mouth_clahe_strength``.
-
-        Falls back to the input when the lips mask is missing
-        or the mouth area is too small.
-        """
-        if lips_mask is None or image.size == 0:
-            return image
-        if lips_mask.shape != image.shape[:2]:
-            return image
-        mouth_mask = (lips_mask > 128).astype(np.uint8)
-        if int(mouth_mask.sum()) < 100:
-            return image
-        return image
-
     def _restore_reference_detail(
         self,
         image: np.ndarray,
@@ -3205,35 +3162,6 @@ class MuseTalkApiRuntime:
             return 1e6
         diff = generated.astype(np.float32) - reference.astype(np.float32)
         return float((diff[sel] ** 2).mean())
-
-    @staticmethod
-    def _soft_upper_mask(
-        height: int,
-        soft_start_ratio: float = 0.40,
-        soft_end_ratio: float = 0.60,
-    ) -> np.ndarray:
-        """Soft upper-face mask, shape ``(height, 1, 1)``.
-
-        Returns 1.0 above ``soft_start_ratio * height``, linear
-        ramp down to 0 at ``soft_end_ratio * height``, 0 below.
-        Used to apply upper-face post-processing (color match /
-        detail restore / sharpen) without a hard seam at the
-        upper/lower boundary.
-        """
-        mask = np.ones((height, 1, 1), dtype=np.float32)
-        soft_start = int(height * soft_start_ratio)
-        soft_end = int(height * soft_end_ratio)
-        if soft_start < 0:
-            soft_start = 0
-        if soft_end > height:
-            soft_end = height
-        if soft_end > soft_start:
-            ramp = np.linspace(1.0, 0.0, soft_end - soft_start, dtype=np.float32)
-            mask[soft_start:soft_end, 0, 0] = ramp
-            mask[soft_end:, 0, 0] = 0.0
-        elif soft_start >= height:
-            mask[:] = 0.0
-        return mask
 
     @staticmethod
     def _face_color_histogram_distance(
@@ -3515,7 +3443,7 @@ class MuseTalkApiRuntime:
                 lips_mask: Optional[np.ndarray] = None
                 if face_parser is not None and source_index not in skin_masks:
                     try:
-                        mask_array_b, crop_box_b = material
+                        _, crop_box_b = material
                         body = Image.fromarray(original_frame[:, :, ::-1])
                         face_large = body.crop(crop_box_b)
                         skin_parsing = face_parser(face_large, mode="skin_only")
@@ -3561,12 +3489,6 @@ class MuseTalkApiRuntime:
                 resized = self._restore_reference_detail(
                     resized, reference_crop, mouth_detail_strength, skin_mask=skin_mask
                 )
-                # Local color-block fix on the mouth. Done after
-                # detail restore so the per-tile drift in the
-                # generated open-mouth area is the only thing the
-                # equalizer sees -- skin and other regions are
-                # left alone.
-                resized = self._fix_mouth_color_block(resized, lips_mask)
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
                 # Output-level temporal blend. After all post-
                 # processing, mix the current face crop with the
