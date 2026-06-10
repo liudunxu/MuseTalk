@@ -259,7 +259,7 @@ class LipSyncRequest(BaseModel):
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
     blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
-    color_match_strength: float = Field(0.85, ge=0.0, le=1.0)
+    color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.40, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
@@ -2941,13 +2941,13 @@ class MuseTalkApiRuntime:
 
         image_float = image.astype(np.float32)
         reference_float = reference.astype(np.float32)
-        # Compute color stats on the upper face only (y < 55%) so
-        # the mouth area (y 55-100%) doesn't pull the stats toward
-        # lip/teeth colors. Apply the color transfer with a SOFT
-        # mask (1.0 at y < 40%, ramping to 0 at y > 60%) so there
-        # is no hard seam at the upper/lower boundary. The mouth
-        # area keeps its generated colors; the transition into the
-        # upper face is smooth.
+        # Compute color stats on the upper face only (y < 55%) so the
+        # mouth area (y 55-100%) doesn't pull the stats toward lip/
+        # teeth colors. Apply the color transfer ONLY to the upper
+        # face -- the mouth is left untouched and keeps its
+        # generated colors. A hard cutoff at 55% avoids the visible
+        # color band a smooth-mask approach can produce in the
+        # transition zone.
         height = image_float.shape[0]
         cutoff = int(height * 0.55)
         if cutoff <= 1 or cutoff >= height - 1:
@@ -2960,20 +2960,14 @@ class MuseTalkApiRuntime:
         image_std = image_std.reshape(1, 1, 3)
         reference_mean = reference_mean.reshape(1, 1, 3)
         reference_std = reference_std.reshape(1, 1, 3)
-        # Whole-image per-channel transfer.
-        matched = (
-            (image_float - image_mean)
+        matched_upper = (
+            (image_upper - image_mean)
             * (reference_std / np.maximum(image_std, 1.0))
             + reference_mean
         )
-        blended = image_float * (1.0 - strength) + matched * strength
-        soft_mask = self._soft_upper_mask(height)
-        # Where soft_mask is 1 -> use color-matched; where 0 -> keep
-        # raw generated. Smooth transition between 40% and 60% of
-        # face height avoids the visible color band a hard cutoff
-        # would produce.
-        result = image_float * (1.0 - soft_mask) + blended * soft_mask
-        return np.clip(result, 0, 255).astype(np.uint8)
+        blended_upper = image_upper * (1.0 - strength) + matched_upper * strength
+        image_float[:cutoff, :, :] = blended_upper
+        return np.clip(image_float, 0, 255).astype(np.uint8)
 
     def _sharpen_image(self, image: np.ndarray, strength: float) -> np.ndarray:
         if strength <= 0.0 or image.size == 0:
@@ -2994,21 +2988,21 @@ class MuseTalkApiRuntime:
             return image
 
         height = image.shape[0]
-        cutoff = int(height * 0.55)
-        if cutoff <= 1 or cutoff >= height - 1:
+        if height <= 1:
             return image
-        # Apply detail restore with a soft upper-face mask (1.0 at
-        # y < 40%, ramping to 0 at y > 60%) so the reference's
-        # high-frequency content fades out smoothly before the
-        # mouth area. Avoids the visible color band a hard cutoff
-        # at y = 55% would produce.
+        # Apply detail restore to the WHOLE face crop. Layering the
+        # reference's high-frequency content onto the generated
+        # mouth actually masks MuseTalk's per-tile color drift
+        # (the most common artifact on this pipeline) and was
+        # confirmed on the live test as the better default. A
+        # hard or soft mask on the mouth leaves the generated
+        # region untouched and lets the underlying color blocks
+        # survive into the final frame.
         reference_float = reference.astype(np.float32)
         reference_blur = cv2.GaussianBlur(reference_float, (0, 0), 1.0)
         detail = reference_float - reference_blur
         restored = image.astype(np.float32) + detail * strength
-        soft_mask = self._soft_upper_mask(height)
-        result = image.astype(np.float32) * (1.0 - soft_mask) + restored * soft_mask
-        return np.clip(result, 0, 255).astype(np.uint8)
+        return np.clip(restored, 0, 255).astype(np.uint8)
 
     def _laplacian_variance(self, image: np.ndarray) -> float:
         if image.size == 0:
