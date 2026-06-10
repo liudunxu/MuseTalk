@@ -259,6 +259,7 @@ class LipSyncRequest(BaseModel):
     parsing_mode: str = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
     blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
+    lips_blend_dilation: int = Field(0, ge=0, le=10)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
     mouth_color_match_strength: float = Field(0.45, ge=0.0, le=1.0)
@@ -3337,6 +3338,7 @@ class MuseTalkApiRuntime:
         parsing_mode: str,
         blend_upper_boundary_ratio: float,
         blend_mask_blur_ratio: float,
+        lips_blend_dilation: int,
         color_match_strength: float,
         mouth_detail_strength: float,
         mouth_color_match_strength: float,
@@ -3421,6 +3423,7 @@ class MuseTalkApiRuntime:
                             fp=face_parser,
                             mode=parsing_mode,
                             mask_blur_ratio=blend_mask_blur_ratio,
+                            lips_dilation=lips_blend_dilation,
                         )
                         blend_materials[source_index] = (mask_array, tuple(crop_box))
                     except Exception:
@@ -4296,6 +4299,7 @@ class MuseTalkApiRuntime:
                 payload.parsing_mode,
                 payload.blend_upper_boundary_ratio,
                 payload.blend_mask_blur_ratio,
+                payload.lips_blend_dilation,
                 payload.color_match_strength,
                 payload.mouth_detail_strength,
                 payload.mouth_color_match_strength,
@@ -4594,8 +4598,8 @@ def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str,
 
 @app.post("/api/lipsync")
 def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, object]:
-    if payload.parsing_mode not in {"jaw", "raw", "lips_only"}:
-        raise HTTPException(status_code=400, detail="parsing_mode must be 'jaw', 'raw', or 'lips_only'")
+    if payload.parsing_mode not in {"jaw", "raw", "lips_only", "lips_outer_only"}:
+        raise HTTPException(status_code=400, detail="parsing_mode must be 'jaw', 'raw', 'lips_only', or 'lips_outer_only'")
 
     job_id = uuid.uuid4().hex
     job_input_dir = INPUT_ROOT / job_id

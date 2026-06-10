@@ -122,6 +122,17 @@ class FaceParsing():
                 # included eyes and brows which dragged the badcase
                 # gates' signal toward non-mouth features.
                 parsing = (np.isin(parsing, [11, 12, 13]) * 255).astype(np.uint8)
+            elif mode == "lips_outer_only":
+                # Lip vermilion only (upper lip 12 + lower lip 13).
+                # Excludes the mouth interior (11) so the open-
+                # mouth dark area is NOT synthesized -- the
+                # source's mouth interior is kept. Use this when
+                # the source is closed-mouth and the model would
+                # otherwise generate a wider dark interior than
+                # the source has. Tightest lips mode; useful as
+                # ``parsing_mode`` for the blend mask when even
+                # ``lips_only`` reads as too wide.
+                parsing = (np.isin(parsing, [12, 13]) * 255).astype(np.uint8)
             else:
                 parsing[np.isin(parsing, [1, 11, 12, 13])] = 255
                 parsing[np.where(parsing!=255)] = 0

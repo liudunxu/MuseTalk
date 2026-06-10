@@ -117,15 +117,22 @@ def get_image_prepare_material(
     fp=None,
     mode="raw",
     mask_blur_ratio=0.1,
+    lips_dilation=0,
 ):
     """Build the blend mask and expanded crop box for paste-back.
 
-    For ``mode="lips_only"`` the mask is restricted to the lips
-    (parser classes 11/12/13), bypasses the upper-boundary crop
-    (lips can be at any vertical position), and is dilated by a
-    small elliptical kernel so the blend edge sits a few pixels
+    For ``mode="lips_only"`` and ``mode="lips_outer_only"`` the
+    mask is restricted to the lips, bypasses the upper-boundary
+    crop (lips can be at any vertical position), and optionally
+    dilated by a small elliptical kernel
+    (``lips_dilation > 0``) so the blend edge sits a few pixels
     outside the actual lip boundary. The same ``mask_blur_ratio``
     Gaussian pass still runs.
+
+    ``lips_outer_only`` uses parser classes 12 + 13 (vermilion
+    only) and excludes the mouth interior (11), so the source's
+    open-mouth dark area is not overwritten by the model's wider
+    dark interior.
     """
     body = Image.fromarray(image[:,:,::-1])
 
@@ -142,16 +149,18 @@ def get_image_prepare_material(
     mask_image = Image.new('L', ori_shape, 0)
     mask_image.paste(mask_small, (x-x_s, y-y_s, x1-x_s, y1-y_s))
 
-    if mode == "lips_only":
+    if mode in ("lips_only", "lips_outer_only"):
         # Lips can be at any vertical position, so we skip the
-        # upper-boundary crop that "jaw" / "raw" modes use. Dilate
-        # so the blend edge sits a few pixels outside the actual
-        # lip line, catching generated lip texture right at the
-        # boundary. Then run the same Gaussian pass for the soft
-        # edge.
+        # upper-boundary crop that "jaw" / "raw" modes use. The
+        # caller controls dilation via lips_dilation; 0 keeps the
+        # mask exactly at the parser's lip boundary (tightest
+        # result), 2-3 adds a small safety margin for generated
+        # lip texture right at the boundary.
         mask_array = np.array(mask_image)
-        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-        mask_array = cv2.dilate(mask_array, kernel, iterations=1)
+        if lips_dilation > 0:
+            k = 2 * lips_dilation + 1
+            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+            mask_array = cv2.dilate(mask_array, kernel, iterations=1)
         if mask_blur_ratio > 0:
             blur_kernel_size = int(mask_blur_ratio * ori_shape[0] // 2 * 2) + 1
             mask_array = cv2.GaussianBlur(mask_array, (blur_kernel_size, blur_kernel_size), 0)
