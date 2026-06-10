@@ -109,8 +109,19 @@ class FaceParsing():
                 # a precise "cheek + forehead + jaw" mask (e.g.
                 # reference detail restore) so they do not apply the
                 # reference's closed-mouth high-frequency detail to
-                # the generated open-mouth area.
+                # generated open-mouth area.
                 parsing = (np.isin(parsing, [1]) * 255).astype(np.uint8)
+            elif mode == "lips_only":
+                # Mouth interior (11) + upper lip (12) + lower lip
+                # (13). Precise lip / mouth / teeth mask used by
+                # badcase gates (mouth laplacian, mouth drift) and
+                # by mouth-only post-process (CLAHE, mouth->skin
+                # color match) when we want to exclude eyes / brows
+                # / nose from the mouth mask. The earlier
+                # "not-skin" approximation (`skin_mask < 128`)
+                # included eyes and brows which dragged the badcase
+                # gates' signal toward non-mouth features.
+                parsing = (np.isin(parsing, [11, 12, 13]) * 255).astype(np.uint8)
             else:
                 parsing[np.isin(parsing, [1, 11, 12, 13])] = 255
                 parsing[np.where(parsing!=255)] = 0

@@ -291,6 +291,59 @@ class LipSyncRequest(BaseModel):
         le=1.0,
         description="Disable quality fallback for this run if it would skip more than this fraction of non-prefiltered frames.",
     )
+    # Mouth sharpness floor. Catches the "mouth is completely
+    # smudged" badcase (CodeFormer / MuseTalk / VAE failure):
+    # the lips come out as a single low-variance blob. Default
+    # 5.0 catches 0.5-5 smudges while tolerating normal 50-200
+    # lip motion. 0 disables. The default went 5.0 -> 0 in an
+    # earlier round because the metric was applied to a
+    # 32x32 tile and over-fired; here it is applied to the
+    # BiSeNet lips-only mask so it actually targets the mouth.
+    quality_min_mouth_laplacian: float = Field(
+        5.0,
+        ge=0.0,
+        le=2000.0,
+        description="Mouth-ROI Laplacian floor (applied to the BiSeNet lips mask). Default 5.0 catches a smudged mouth. 0 disables.",
+    )
+    # Mouth vs reference drift. Catches the "generated mouth
+    # does not match the source face" badcase (identity drift,
+    # severe color block, post-process over-shift). Compares
+    # the lips-mask MSE between the post-processed crop and
+    # the reference. Default 500 catches a clearly different
+    # mouth; raise to 800-1500 to be permissive, lower to
+    # 200-300 to be strict. 0 disables.
+    quality_max_mouth_drift_mse: float = Field(
+        500.0,
+        ge=0.0,
+        le=10000.0,
+        description="Lips-mask MSE ceiling vs reference. Default 500 catches identity-drift / severe color block badcases. 0 disables.",
+    )
+    # Skin drift. Catches the "generated face extends past the
+    # mouth" badcase (MuseTalk / CodeFormer failure that
+    # bleeds the inpainter output into the cheek / forehead /
+    # hair). Compares the skin-mask MSE between the post-
+    # processed crop and the reference. Default 200 catches a
+    # skin region that was modified by the pipeline. Raise to
+    # 400-800 to be permissive, lower to 80-150 to be strict.
+    # 0 disables.
+    quality_max_skin_drift_mse: float = Field(
+        200.0,
+        ge=0.0,
+        le=10000.0,
+        description="Skin-mask MSE ceiling vs reference. Default 200 catches frames where the pipeline modified the cheeks / forehead / jaw. 0 disables.",
+    )
+    # Skin sharpness floor. Catches the "skin became a
+    # uniform color blob" badcase (CodeFormer over-smoothing
+    # the cheeks, color-match clipping the entire face to a
+    # single tone). The face parser's skin mask is the region
+    # to inspect. Default 5.0 catches a blurred skin patch.
+    # 0 disables.
+    quality_min_skin_laplacian: float = Field(
+        5.0,
+        ge=0.0,
+        le=2000.0,
+        description="Skin-ROI Laplacian floor. Default 5.0 catches a smudged skin patch. 0 disables.",
+    )
     # Mouth-region postfilter. Catches a single large blurry patch
     # in the generated mouth (CodeFormer failure, VAE collapse)
     # that the whole-image quality gate misses because the
@@ -3114,6 +3167,47 @@ class MuseTalkApiRuntime:
         return float(cv2.Laplacian(gray, cv2.CV_64F).var())
 
     @staticmethod
+    def _masked_laplacian(image: np.ndarray, mask: np.ndarray) -> float:
+        """Laplacian variance over pixels where mask > 128. Used
+        by the badcase gates to ask "is the mouth / skin area
+        a single low-variance blob?". Returns 0.0 on empty
+        mask or shape mismatch so the gate sees an unsafe
+        signal and falls back to source.
+        """
+        if image.size == 0 or mask.size == 0:
+            return 0.0
+        if image.shape[:2] != mask.shape:
+            return 0.0
+        if int((mask > 128).sum()) < 16:
+            return 0.0
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        lap = cv2.Laplacian(gray, cv2.CV_64F)
+        return float(lap[mask > 128].var())
+
+    @staticmethod
+    def _masked_mse(generated: np.ndarray, reference: np.ndarray, mask: np.ndarray) -> float:
+        """Mean squared error over pixels where mask > 128.
+        Used by the badcase gates to ask "did the pipeline
+        modify the skin / mouth area relative to the source
+        frame?". Returns a large sentinel (1e6) on shape
+        mismatch or empty mask so the gate sees an unsafe
+        signal and falls back to source.
+        """
+        if (
+            generated.size == 0
+            or reference.size == 0
+            or mask.size == 0
+        ):
+            return 1e6
+        if generated.shape != reference.shape or generated.shape[:2] != mask.shape:
+            return 1e6
+        sel = mask > 128
+        if int(sel.sum()) < 16:
+            return 1e6
+        diff = generated.astype(np.float32) - reference.astype(np.float32)
+        return float((diff[sel] ** 2).mean())
+
+    @staticmethod
     def _soft_upper_mask(
         height: int,
         soft_start_ratio: float = 0.40,
@@ -3326,6 +3420,10 @@ class MuseTalkApiRuntime:
         quality_max_face_outside_mouth_mse: float,
         quality_max_face_tile_mse: float,
         quality_max_face_color_histogram_distance: float,
+        quality_min_mouth_laplacian: float,
+        quality_max_mouth_drift_mse: float,
+        quality_max_skin_drift_mse: float,
+        quality_min_skin_laplacian: float,
         face_parser: Optional[FaceParsing],
     ) -> List[str]:
         """Write every output frame to ``output_dir`` and return a
@@ -3349,6 +3447,7 @@ class MuseTalkApiRuntime:
         provenance: List[str] = ["passthrough"] * output_frame_count
         blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
         skin_masks: Dict[int, Optional[np.ndarray]] = {}
+        lips_masks: Dict[int, Optional[np.ndarray]] = {}
         previous_resized: Optional[np.ndarray] = None
         for output_index in _progress(
             range(output_frame_count),
@@ -3404,6 +3503,7 @@ class MuseTalkApiRuntime:
                 # visible color block because the reference is
                 # closed-mouth).
                 skin_mask: Optional[np.ndarray] = None
+                lips_mask: Optional[np.ndarray] = None
                 if face_parser is not None and source_index not in skin_masks:
                     try:
                         mask_array_b, crop_box_b = material
@@ -3417,14 +3517,27 @@ class MuseTalkApiRuntime:
                         ye = ys + (y2 - y1)
                         xe = min(xe, skin_full.shape[1])
                         ye = min(ye, skin_full.shape[0])
-                        cropped = skin_full[ys:ye, xs:xe]
-                        if cropped.shape == (y2 - y1, x2 - x1):
-                            skin_masks[source_index] = cropped
+                        cropped_skin = skin_full[ys:ye, xs:xe]
+                        if cropped_skin.shape == (y2 - y1, x2 - x1):
+                            skin_masks[source_index] = cropped_skin
                         else:
                             skin_masks[source_index] = None
+                        # Lips mask (mouth interior + upper + lower
+                        # lip, classes 11/12/13). Precise mouth
+                        # region used by the badcase gates and by
+                        # mouth-only post-process steps.
+                        lips_parsing = face_parser(face_large, mode="lips_only")
+                        lips_full = np.array(lips_parsing)
+                        cropped_lips = lips_full[ys:ye, xs:xe]
+                        if cropped_lips.shape == (y2 - y1, x2 - x1):
+                            lips_masks[source_index] = cropped_lips
+                        else:
+                            lips_masks[source_index] = None
                     except Exception:
                         skin_masks[source_index] = None
+                        lips_masks[source_index] = None
                 skin_mask = skin_masks.get(source_index)
+                lips_mask = lips_masks.get(source_index)
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
                 # Pull the generated mouth's mean / std toward
                 # the reference's skin tone. After this the
@@ -3535,6 +3648,53 @@ class MuseTalkApiRuntime:
                     reference_crop,
                     quality_min_laplacian,
                     quality_min_sharpness_ratio,
+                ):
+                    blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
+                # --- Badcase gates (lips / skin drift) ---
+                # These four gates answer "did the pipeline
+                # produce a frame we should NOT ship?" and
+                # default-on per the user's "宁可对该帧使用
+                # 原帧" policy. All four use the BiSeNet
+                # lips / skin mask, so they are precise about
+                # the region they inspect.
+                if (
+                    lips_mask is not None
+                    and quality_min_mouth_laplacian > 0.0
+                    and self._masked_laplacian(resized, lips_mask)
+                    < quality_min_mouth_laplacian
+                ):
+                    blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
+                if (
+                    lips_mask is not None
+                    and quality_max_mouth_drift_mse > 0.0
+                    and self._masked_mse(resized, reference_crop, lips_mask)
+                    > quality_max_mouth_drift_mse
+                ):
+                    blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
+                if (
+                    skin_mask is not None
+                    and quality_max_skin_drift_mse > 0.0
+                    and self._masked_mse(resized, reference_crop, skin_mask)
+                    > quality_max_skin_drift_mse
+                ):
+                    blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
+                    cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
+                    continue
+                if (
+                    skin_mask is not None
+                    and quality_min_skin_laplacian > 0.0
+                    and self._masked_laplacian(resized, skin_mask)
+                    < quality_min_skin_laplacian
                 ):
                     blend_status = "quality_fallback"
                     provenance[output_index] = blend_status
@@ -4178,6 +4338,10 @@ class MuseTalkApiRuntime:
                 payload.quality_max_face_outside_mouth_mse,
                 payload.quality_max_face_tile_mse,
                 payload.quality_max_face_color_histogram_distance,
+                payload.quality_min_mouth_laplacian,
+                payload.quality_max_mouth_drift_mse,
+                payload.quality_max_skin_drift_mse,
+                payload.quality_min_skin_laplacian,
                 face_parser,
             )
             quality_fallback_frames = sum(
