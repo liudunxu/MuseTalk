@@ -265,7 +265,12 @@ class LipSyncRequest(BaseModel):
     parsing_mode: Literal["jaw", "raw", "lips_only", "lips_outer_only"] = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
     blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
-    lips_blend_dilation: int = Field(0, ge=0, le=10)
+    # Final lips-only paste margin. A zero-margin parser lip
+    # mask can clip valid MuseTalk mouth motion right at the lip
+    # boundary, making some phonemes look unsynced. Default 2
+    # gives the generated mouth a small soft edge without going
+    # back to a broad jaw/cheek paste.
+    lips_blend_dilation: int = Field(2, ge=0, le=10)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
     mouth_color_match_strength: float = Field(0.45, ge=0.0, le=1.0)
