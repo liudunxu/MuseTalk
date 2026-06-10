@@ -118,6 +118,15 @@ def get_image_prepare_material(
     mode="raw",
     mask_blur_ratio=0.1,
 ):
+    """Build the blend mask and expanded crop box for paste-back.
+
+    For ``mode="lips_only"`` the mask is restricted to the lips
+    (parser classes 11/12/13), bypasses the upper-boundary crop
+    (lips can be at any vertical position), and is dilated by a
+    small elliptical kernel so the blend edge sits a few pixels
+    outside the actual lip boundary. The same ``mask_blur_ratio``
+    Gaussian pass still runs.
+    """
     body = Image.fromarray(image[:,:,::-1])
 
     x, y, x1, y1 = face_box
@@ -132,6 +141,21 @@ def get_image_prepare_material(
     mask_small = mask_image.crop((x-x_s, y-y_s, x1-x_s, y1-y_s))
     mask_image = Image.new('L', ori_shape, 0)
     mask_image.paste(mask_small, (x-x_s, y-y_s, x1-x_s, y1-y_s))
+
+    if mode == "lips_only":
+        # Lips can be at any vertical position, so we skip the
+        # upper-boundary crop that "jaw" / "raw" modes use. Dilate
+        # so the blend edge sits a few pixels outside the actual
+        # lip line, catching generated lip texture right at the
+        # boundary. Then run the same Gaussian pass for the soft
+        # edge.
+        mask_array = np.array(mask_image)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        mask_array = cv2.dilate(mask_array, kernel, iterations=1)
+        if mask_blur_ratio > 0:
+            blur_kernel_size = int(mask_blur_ratio * ori_shape[0] // 2 * 2) + 1
+            mask_array = cv2.GaussianBlur(mask_array, (blur_kernel_size, blur_kernel_size), 0)
+        return mask_array, crop_box
 
     # keep upper_boundary_ratio of talking area
     width, height = mask_image.size
