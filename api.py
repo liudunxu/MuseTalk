@@ -243,8 +243,8 @@ class LipSyncRequest(BaseModel):
         0.60, ge=0.0, le=1.0,
         description="Mouth-region mean abs diff break threshold; 0 disables.",
     )
-    target_bbox_smoothing_window: int = Field(7, ge=1, le=15)
-    target_bbox_smoothing_max_center_shift: float = Field(1.0, ge=0.0, le=5.0)
+    target_bbox_smoothing_window: int = Field(5, ge=1, le=15)
+    target_bbox_smoothing_max_center_shift: float = Field(0.85, ge=0.0, le=5.0)
     identity_scan_interval: int = Field(0, ge=0, le=300, description="0 means scan about 2 frames per second")
     identity_scan_max_frames: int = Field(0, ge=0, description="0 means scan all sampled identity frames")
     identity_scan_require_landmark_match: bool = False
@@ -304,16 +304,18 @@ class LipSyncRequest(BaseModel):
     # similar to the surrounding face but the local sharpness
     # has dropped. Complements the color histogram check above
     # which only catches color shifts, not blurriness. 0
-    # disables. Default 5.0 = light check: tolerates normal
-    # lip-motion variance (50-200) while catching a blurred
-    # patch (0.5-5). Raise to 10-20 to only catch the most
-    # severe cases, lower to 1-2 to also catch moderate
-    # blurriness.
+    # disables. Default 0 (OFF): the Laplacian check tends to
+    # over-fire on normal lip motion (a 32x32 mouth tile that
+    # moved 20px between frames already pushes the variance
+    # below the floor), which collapses effective throughput to
+    # near-zero. Enable per-request only when you have a
+    # specific badcase (e.g. CodeFormer failure producing
+    # blurred faces).
     quality_mouth_min_laplacian: float = Field(
-        5.0,
+        0.0,
         ge=0.0,
         le=2000.0,
-        description="Mouth-region Laplacian floor. 0 disables. Default 5.0 = light check that catches a blurred patch while tolerating normal lip motion.",
+        description="Mouth-region Laplacian floor. 0 (default) disables. Raise to 5-20 to catch blurred mouths at the cost of rejecting normal lip motion.",
     )
     # Light color-block check. Compares the COLOR DISTRIBUTION
     # (per-channel histogram) of the upper face (y < 55%) between
@@ -356,19 +358,20 @@ class LipSyncRequest(BaseModel):
     # Localized color-block fallback. Divides the face crop into
     # tiles (default 32x32) and computes per-tile MSE vs the
     # reference. If any single tile exceeds this threshold, the
-    # frame falls back to source. 0 disables. Default 500 catches
-    # a single hard color block in any 32x32 tile (most color
-    # blocks register in the 1000-3000 range on this metric)
-    # while tolerating normal per-tile lip-motion variation
-    # (typically 100-400). Set to 0 to disable, or 200-300 for
-    # stricter behavior. Compensates for the upper-face-only
-    # color histogram check, which cannot see color blocks in
-    # the mouth region.
+    # frame falls back to source. 0 disables (default). The
+    # 32x32 tile size is too small to tolerate normal lip
+    # motion: a tile that shifted 20px between frames already
+    # pushes the max-tile MSE well past 500, so enabling this
+    # in default requests collapses effective throughput to
+    # near-zero. Either lower the tile size to make this
+    # smoother (e.g. pass 64 in code), or run it with a much
+    # higher ceiling (5000+) per-request. The intended use
+    # case is a one-shot badcase, not a default safety net.
     quality_max_face_tile_mse: float = Field(
-        500.0,
+        0.0,
         ge=0.0,
         le=10000.0,
-        description="Per-tile MSE ceiling on the face crop. Default 500 catches single hard color blocks. 0 disables.",
+        description="Per-tile MSE ceiling on the face crop. 0 (default) disables. Enable per-request with a high ceiling to catch obvious color blocks.",
     )
     # Source-face motion-blur prefilter. Catches frames where the
     # detected face is too blurry (camera motion, fast head turn)
@@ -437,11 +440,19 @@ class LipSyncRequest(BaseModel):
     # between frames. 0 disables (current per-frame behavior).
     # Per-request 0.2-0.3 is a light smooth, 0.4-0.5 is heavy
     # and may ghost on fast motion.
+    # Output-level temporal blend. After all post-processing,
+    # mixes the current face crop with the previous frame's face
+    # crop. 0 disables (default). Bbox smoothing already locks
+    # position, and the previous default (0.20) was layered on
+    # top -- in practice this mainly smeared the lipsync output
+    # against the source frame, costing more than it saved. Use
+    # per-request 0.20-0.30 only if the source itself is
+    # jittering for reasons the bbox gate cannot see.
     output_temporal_blend: float = Field(
-        0.20,
+        0.0,
         ge=0.0,
         le=0.9,
-        description="Output-level temporal blend with the previous frame. 0 disables.",
+        description="Output-level temporal blend with the previous frame. 0 (default) disables.",
     )
     # Side-face / fast-turn prefilters (diffusion-only). MuseTalk does
     # not currently implement yaw-based skipping; values are accepted
@@ -528,13 +539,14 @@ class LipSyncRequest(BaseModel):
         description="Run CodeFormer face restoration on the aligned face crops before paste-back.",
     )
     codeformer_fidelity_weight: float = Field(
-        0.3,
+        0.5,
         ge=0.0,
         le=1.0,
         description="CodeFormer fidelity weight. 0 = sharpest (most codebook-driven, identity drift), "
-                    "1 = closest to input. Default 0.3 prioritizes visible mouth detail (lips, "
-                    "teeth) over fidelity to the inpainter's output. Raise to 0.5-0.85 to better "
-                    "preserve the inpainter's lipsync against the codebook's 'typical' face.",
+                    "1 = closest to input. Default 0.5 = middle ground: keeps enough inpainter "
+                    "detail to preserve lipsync shape, but lets CodeFormer clean up obvious color "
+                    "blocks. Lower (0.2-0.4) for sharper teeth/lips at the cost of codebook "
+                    "deviation; higher (0.7-0.9) to stay closer to the inpainter's output.",
     )
     codeformer_adain: bool = Field(
         True,
@@ -4113,13 +4125,17 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         prov_counts[status] = prov_counts.get(status, 0) + 1
     speech_gate = result.get("speech_gate") or {}
     codeformer = result.get("codeformer") or {}
+    gen = int(result.get("generated_output_frames", 0))
+    qf = int(result.get("quality_fallback_frames", 0))
+    be = prov_counts["blend_error"]
+    effective_blended = max(0, gen - qf - be)
     logger.info(
         "[LipSync-report] job_id=%s\n"
         "  source: src_frames=%d out_frames=%d src_fps=%.3f audio_fps=%.3f\n"
         "  identity: source=%s count=%d coverage=%.3f sim=%.3f backend=%s\n"
         "  target: matched=%d filled_init=%d continuity_filled=%d smoothed=%d eligible=%d prefiltered_blur=%d prefiltered_side=%d\n"
         "  filtered: motion=%d fast_motion=%d mouth_diff=%d small_face=%d short_segment=%d\n"
-        "  generated: gen=%d quality_fallback=%d passthrough=%d blend_error=%d\n"
+        "  generated: gen=%d quality_fallback=%d passthrough=%d blend_error=%d blended=%d\n"
         "  identity_sim: min/med/max=%.3f/%.3f/%.3f\n"
         "  speech_gate: enabled=%s active=%s\n"
         "  codeformer: enabled=%s available=%s",
@@ -4149,6 +4165,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         int(result.get("quality_fallback_frames", 0)),
         prov_counts["passthrough"],
         prov_counts["blend_error"],
+        effective_blended,
         float(result.get("identity_similarity_min", 0.0)),
         float(result.get("identity_similarity_median", 0.0)),
         float(result.get("identity_similarity_max", 0.0)),
