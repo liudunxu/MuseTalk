@@ -19,6 +19,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import cv2
 import numpy as np
+from PIL import Image
 import requests
 import torch
 
@@ -2963,6 +2964,7 @@ class MuseTalkApiRuntime:
         image: np.ndarray,
         reference: np.ndarray,
         strength: float,
+        skin_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         if strength <= 0.0 or image.size == 0 or reference.size == 0:
             return image
@@ -2972,19 +2974,27 @@ class MuseTalkApiRuntime:
         height = image.shape[0]
         if height <= 1:
             return image
-        # Apply detail restore to the WHOLE face crop. Layering the
-        # reference's high-frequency content onto the generated
-        # mouth actually masks MuseTalk's per-tile color drift
-        # (the most common artifact on this pipeline) and was
-        # confirmed on the live test as the better default. A
-        # hard or soft mask on the mouth leaves the generated
-        # region untouched and lets the underlying color blocks
-        # survive into the final frame.
+        # Apply detail restore on the face but EXCLUDE the mouth /
+        # lips / teeth / nose / eyes. Layering the reference's
+        # high-frequency content on the generated *open* mouth
+        # introduces a visible color block -- the reference is
+        # closed-mouth, so its detail (lip lines, skin texture)
+        # does not match the generated open-mouth area. Use a
+        # skin-only mask (class 1 from BiSeNet / CelebAMask-HQ)
+        # when available so the rest of the face still picks up
+        # the reference's clean detail.
         reference_float = reference.astype(np.float32)
         reference_blur = cv2.GaussianBlur(reference_float, (0, 0), 1.0)
         detail = reference_float - reference_blur
         restored = image.astype(np.float32) + detail * strength
-        return np.clip(restored, 0, 255).astype(np.uint8)
+        if skin_mask is None:
+            return np.clip(restored, 0, 255).astype(np.uint8)
+        if skin_mask.shape != image.shape[:2]:
+            return np.clip(restored, 0, 255).astype(np.uint8)
+        skin_mask_f = skin_mask.astype(np.float32) / 255.0
+        skin_mask_3 = skin_mask_f[:, :, None]
+        result = image.astype(np.float32) * (1.0 - skin_mask_3) + restored * skin_mask_3
+        return np.clip(result, 0, 255).astype(np.uint8)
 
     def _laplacian_variance(self, image: np.ndarray) -> float:
         if image.size == 0:
@@ -3227,6 +3237,7 @@ class MuseTalkApiRuntime:
         frame_count = len(frames)
         provenance: List[str] = ["passthrough"] * output_frame_count
         blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
+        skin_masks: Dict[int, Optional[np.ndarray]] = {}
         previous_resized: Optional[np.ndarray] = None
         for output_index in _progress(
             range(output_frame_count),
@@ -3275,8 +3286,38 @@ class MuseTalkApiRuntime:
                     interpolation=cv2.INTER_LANCZOS4,
                 )
                 reference_crop = original_frame[y1:y2, x1:x2]
+                # Skin-only mask for detail restore. Limits the
+                # reference's high-frequency detail to the cheek /
+                # forehead / jaw area so it is NOT layered on the
+                # generated open-mouth area (where it produces a
+                # visible color block because the reference is
+                # closed-mouth).
+                skin_mask: Optional[np.ndarray] = None
+                if face_parser is not None and source_index not in skin_masks:
+                    try:
+                        mask_array_b, crop_box_b = material
+                        body = Image.fromarray(original_frame[:, :, ::-1])
+                        face_large = body.crop(crop_box_b)
+                        skin_parsing = face_parser(face_large, mode="skin_only")
+                        skin_full = np.array(skin_parsing)
+                        xs = max(0, x1 - crop_box_b[0])
+                        ys = max(0, y1 - crop_box_b[1])
+                        xe = xs + (x2 - x1)
+                        ye = ys + (y2 - y1)
+                        xe = min(xe, skin_full.shape[1])
+                        ye = min(ye, skin_full.shape[0])
+                        cropped = skin_full[ys:ye, xs:xe]
+                        if cropped.shape == (y2 - y1, x2 - x1):
+                            skin_masks[source_index] = cropped
+                        else:
+                            skin_masks[source_index] = None
+                    except Exception:
+                        skin_masks[source_index] = None
+                skin_mask = skin_masks.get(source_index)
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
-                resized = self._restore_reference_detail(resized, reference_crop, mouth_detail_strength)
+                resized = self._restore_reference_detail(
+                    resized, reference_crop, mouth_detail_strength, skin_mask=skin_mask
+                )
                 resized = self._sharpen_image(resized, mouth_sharpen_strength)
                 # Output-level temporal blend. After all post-
                 # processing, mix the current face crop with the
