@@ -273,7 +273,7 @@ class LipSyncRequest(BaseModel):
     lips_blend_dilation: int = Field(2, ge=0, le=10)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
-    mouth_color_match_strength: float = Field(0.45, ge=0.0, le=1.0)
+    mouth_color_match_strength: float = Field(0.30, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.50, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
@@ -3087,7 +3087,20 @@ class MuseTalkApiRuntime:
         out = image_float * (1.0 - strength + strength * scale) + strength * shift
         mouth_mask_3 = mouth_mask[:, :, None].astype(np.float32)
         result = image_float * (1.0 - mouth_mask_3) + out * mouth_mask_3
-        return np.clip(result, 0, 255).astype(np.uint8)
+        result_u8 = np.clip(result, 0, 255).astype(np.uint8)
+
+        # The skin-tone match should fix brightness / temperature,
+        # not wash the lips toward gray. Preserve most of the
+        # generated mouth saturation inside the lips mask; upper
+        # lips are especially sensitive to desaturation.
+        original_hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        result_hsv = cv2.cvtColor(result_u8, cv2.COLOR_BGR2HSV)
+        saturation_floor = (original_hsv[:, :, 1].astype(np.float32) * 0.85).astype(np.uint8)
+        result_hsv[:, :, 1][mouth_mask] = np.maximum(
+            result_hsv[:, :, 1][mouth_mask],
+            saturation_floor[mouth_mask],
+        )
+        return cv2.cvtColor(result_hsv, cv2.COLOR_HSV2BGR)
 
     def _restore_reference_detail(
         self,
