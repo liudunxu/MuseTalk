@@ -146,3 +146,46 @@ When changing API behavior:
 - Run `git diff --check` before committing.
 - Do not commit generated media, downloaded inputs, model weights, or cache files.
 - If a change affects lipsync quality, test on the server when possible because local environments often lack the right GPU/model stack.
+
+## Tuning Methodology & Lessons Learned
+
+Knowledge accumulated from iterative lipsync quality work. Follow these to avoid re-discovering the same pitfalls.
+
+### Filter tuning: change the method before changing the threshold
+
+When a quality gate rejects too many valid frames or lets bad frames through, do not just adjust the threshold:
+
+1. **Identify which gate is firing.** Log per-gate rejection counters (`prefiltered_blur`, `prefiltered_side`, `small_face`, `motion`, `fast_motion`, `mouth_diff`, `lipsync`). The jumping counter tells you which gate is wrong, not the cutoff.
+2. **Check that the gate answers the right question.** Identity matching answers *which person may be edited*; speech activity answers *whether this frame should be driven by lipsync*. If a single gate conflates them, split it before tuning.
+3. **Reconsider the metric, not just the cutoff.** Whole-face MSE is too coarse to catch local color blocks. CHISQR on the upper-face color histogram plus a Laplacian variance on the mouth region catches what MSE misses. The right metric beats the right number.
+4. **Use conservative short-gap filling, not loose thresholds.** Brief identity-miss gaps are normal. Fill bounded gaps with the most-recent confirmed target rather than weakening the identity gate.
+
+### Avoid color-block / boundary artifacts
+
+- Sharp horizontal / vertical cuts in the mask produce visible color seams. Use a linear ramp (e.g. `_soft_upper_mask`) for transitions, not a hard threshold.
+- Color match and reference detail restore should be blended, not switched. A soft mask (e.g. 0.40→0.60 transition) avoids the badcase where one half of the lips went solid-color.
+- Bbox smoothing only locks position, not content. Add an output-level temporal blend (per-frame weighted average) for frame-to-frame stability.
+- Teeth halos and over-sharpening are common when the generated mouth is upscaled and pasted back without matching the reference's color and detail statistics. Lighten the strength, do not disable the step.
+
+### Face lock design
+
+- A "soft" lock must actually implement the fallback. Track the best *unlocked* candidate as well as the best *locked* candidate; prefer locked, fall back to unlocked. Otherwise the docstring lies and output silently dies (e.g. `matched=2, eligible=0, gen=0, passthrough=702`).
+- IoU is brittle for face tracking; a small rotation or scale change kills it. Center-distance (relative to face width) is more robust to in-plane motion.
+- Lock knobs should default to 0 (opt-in). The default behavior is the safe / permissive path; callers opt into stricter locking per request.
+- "Speaking moves, silence stays still" still applies inside a lock: silent frames should pass through unchanged even when the locked target is visible.
+
+### Frame-stability checks
+
+- Frame jitter and mouth-region blur are common when identity, lock, or upscaling fails. Expose a `mouth_sharpen_strength` knob (unsharp mask) and a per-frame `output_temporal_blend` knob. Both are opt-in / tunable, not forced.
+
+### CodeFormer is optional
+
+`CodeFormer fidelity restoration` is a quality add-on, not a required dependency. The loader returns `(None, "<error>")` when the checkpoint is missing and reports `available=False` in the response. If users see `available=False`:
+
+- Verify `models/codeformer/codeformer.pth` exists on the server.
+- If missing, either download from the upstream CodeFormer release or set `codeformer_enabled=false` per request. The lipsync pipeline continues to work without it.
+- Do not let a missing checkpoint break the request — degrade gracefully.
+
+### MuseTalk is encoder-decoder, not diffusion
+
+MuseTalk generates the mouth region with a single UNet pass conditioned on Whisper audio features via cross-attention. It is **not** a diffusion model. There is no scheduler, timestep loop, or `num_inference_steps`. Do not add diffusion-only fields (cfg scale, denoise strength, eta, etc.) to the API — they are ignored and confuse callers.
