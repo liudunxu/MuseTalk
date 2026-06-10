@@ -2959,6 +2959,63 @@ class MuseTalkApiRuntime:
         sharpened = cv2.addWeighted(image, 1.0 + strength, blurred, -strength, 0)
         return np.clip(sharpened, 0, 255).astype(np.uint8)
 
+    def _match_mouth_to_skin_tone(
+        self,
+        image: np.ndarray,
+        reference: np.ndarray,
+        skin_mask: Optional[np.ndarray],
+        strength: float = 0.40,
+    ) -> np.ndarray:
+        """Color-match the generated mouth to the reference's
+        skin tone.
+
+        MuseTalk's output mouth often sits at a different
+        color temperature / brightness than the source subject
+        (the inpainter was trained on a different skin-tone
+        distribution). On a darker-skinned source the gap is
+        especially obvious: the generated mouth reads as
+        noticeably lighter than the rest of the face even
+        though the rest of the face is fine. The upper-face
+        color match does not see the mouth (hard-cut at 55%),
+        and CLAHE only equalizes local contrast, not global
+        brightness / temperature.
+
+        Pull the generated mouth's per-channel mean and std
+        toward the reference's *skin* mean / std (the source
+        subject's true skin tone, not the mouth itself, which
+        is closed in the reference and would over-tint the
+        generated open mouth). Apply only inside the mouth
+        region (skin_mask < 128) so the surrounding skin is
+        untouched.
+        """
+        if strength <= 0.0 or image.size == 0 or reference.size == 0:
+            return image
+        if image.shape != reference.shape:
+            return image
+        if skin_mask is None or skin_mask.shape != image.shape[:2]:
+            return image
+        ref_skin_pixels = reference[skin_mask > 128]
+        if ref_skin_pixels.size == 0 or ref_skin_pixels.shape[0] < 100:
+            return image
+        ref_mean = ref_skin_pixels.mean(axis=0)
+        ref_std = ref_skin_pixels.std(axis=0)
+        mouth_mask = (skin_mask < 128)
+        if int(mouth_mask.sum()) < 100:
+            return image
+        gen_mouth_pixels = image[mouth_mask]
+        gen_mean = gen_mouth_pixels.mean(axis=0)
+        gen_std = gen_mouth_pixels.std(axis=0)
+        # Per-channel scale + shift that maps gen_mouth's
+        # distribution to ref_skin's. Strength blends: 0 keeps
+        # gen, 1 fully matches.
+        scale = ref_std / np.maximum(gen_std, 1.0)
+        shift = ref_mean - gen_mean * scale
+        image_float = image.astype(np.float32)
+        out = image_float * (1.0 - strength + strength * scale) + strength * shift
+        mouth_mask_3 = mouth_mask[:, :, None].astype(np.float32)
+        result = image_float * (1.0 - mouth_mask_3) + out * mouth_mask_3
+        return np.clip(result, 0, 255).astype(np.uint8)
+
     def _fix_mouth_color_block(
         self,
         image: np.ndarray,
@@ -3354,6 +3411,16 @@ class MuseTalkApiRuntime:
                         skin_masks[source_index] = None
                 skin_mask = skin_masks.get(source_index)
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
+                # Pull the generated mouth's mean / std toward
+                # the reference's skin tone. After this the
+                # generated mouth is roughly the same global
+                # brightness / temperature as the source skin,
+                # and the per-tile drift left over (local
+                # contrast imbalance) is what CLAHE cleans up
+                # next.
+                resized = self._match_mouth_to_skin_tone(
+                    resized, reference_crop, skin_mask
+                )
                 resized = self._restore_reference_detail(
                     resized, reference_crop, mouth_detail_strength, skin_mask=skin_mask
                 )
