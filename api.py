@@ -14,12 +14,11 @@ import traceback
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Literal, Optional, Tuple
 from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import cv2
 import numpy as np
-from PIL import Image
 import requests
 import torch
 
@@ -256,7 +255,14 @@ class LipSyncRequest(BaseModel):
     lipsync_min_face_area_ratio: float = Field(0.005, ge=0.0, le=1.0)
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
-    parsing_mode: str = "jaw"
+    # Pydantic ``Literal`` rejects unknown values at validation
+    # time with a 422 + detailed schema error, so callers learn
+    # about typos (e.g. ``lips_outermode``) immediately rather
+    # than waiting for the HTTP handler's manual set check.
+    # Keep this in sync with the runtime check in
+    # ``create_lipsync`` so an old client (pre-Literal) still
+    # gets the friendlier 400 with a hint.
+    parsing_mode: Literal["jaw", "raw", "lips_only", "lips_outer_only"] = "jaw"
     blend_upper_boundary_ratio: float = Field(0.58, ge=0.0, le=1.0)
     blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
     lips_blend_dilation: int = Field(0, ge=0, le=10)
@@ -3390,6 +3396,13 @@ class MuseTalkApiRuntime:
             "other": 0,
         }
         previous_resized: Optional[np.ndarray] = None
+        # Track the source_index that produced ``previous_resized``
+        # so the temporal blend skips the cross-source edge. When
+        # ``_source_index_for_output`` jumps (audio-driven speed
+        # changes, retiming) the face crop is from a different
+        # source frame and ``previous_resized`` is stale -- mixing
+        # it into the new crop would smear unrelated content.
+        previous_source_index: Optional[int] = None
         for output_index in _progress(
             range(output_frame_count),
             "render frames",
@@ -3416,7 +3429,14 @@ class MuseTalkApiRuntime:
             try:
                 if source_index not in blend_materials:
                     try:
-                        mask_array, crop_box = get_image_prepare_material(
+                        # One BiSeNet forward per source frame --
+                        # the parser returns the primary blend
+                        # mask AND any auxiliary masks we ask for
+                        # in the same call (lips_only, skin_only),
+                        # so the badcase gates and mouth-only
+                        # post-process can use them without
+                        # re-running the network.
+                        mask_array, crop_box, aux_masks = get_image_prepare_material(
                             original_frame,
                             [x1, y1, x2, y2],
                             upper_boundary_ratio=blend_upper_boundary_ratio,
@@ -3424,8 +3444,13 @@ class MuseTalkApiRuntime:
                             mode=parsing_mode,
                             mask_blur_ratio=blend_mask_blur_ratio,
                             lips_dilation=lips_blend_dilation,
+                            aux_modes=("lips_only", "skin_only"),
                         )
-                        blend_materials[source_index] = (mask_array, tuple(crop_box))
+                        blend_materials[source_index] = (
+                            mask_array,
+                            tuple(crop_box),
+                            aux_masks,
+                        )
                     except Exception:
                         blend_materials[source_index] = None
                 material = blend_materials[source_index]
@@ -3438,42 +3463,47 @@ class MuseTalkApiRuntime:
                     interpolation=cv2.INTER_LANCZOS4,
                 )
                 reference_crop = original_frame[y1:y2, x1:x2]
-                # Skin-only mask for detail restore. Limits the
-                # reference's high-frequency detail to the cheek /
-                # forehead / jaw area so it is NOT layered on the
-                # generated open-mouth area (where it produces a
-                # visible color block because the reference is
-                # closed-mouth).
+                # Aux masks (lips_only / skin_only) come from the
+                # same parser forward that built the primary
+                # blend mask, so we just slice them down to the
+                # face-crop size that downstream post-process
+                # expects. If the cache was populated by a legacy
+                # 2-tuple (pre-parser-merge) entry, fall back to
+                # ``None`` -- the per-frame quality gates all
+                # short-circuit on a ``None`` mask, so this stays
+                # safe.
                 skin_mask: Optional[np.ndarray] = None
                 lips_mask: Optional[np.ndarray] = None
-                if face_parser is not None and source_index not in skin_masks:
+                if source_index not in skin_masks:
                     try:
-                        _, crop_box_b = material
-                        body = Image.fromarray(original_frame[:, :, ::-1])
-                        face_large = body.crop(crop_box_b)
-                        skin_parsing = face_parser(face_large, mode="skin_only")
-                        skin_full = np.array(skin_parsing)
-                        xs = max(0, x1 - crop_box_b[0])
-                        ys = max(0, y1 - crop_box_b[1])
-                        xe = xs + (x2 - x1)
-                        ye = ys + (y2 - y1)
-                        xe = min(xe, skin_full.shape[1])
-                        ye = min(ye, skin_full.shape[0])
-                        cropped_skin = skin_full[ys:ye, xs:xe]
-                        if cropped_skin.shape == (y2 - y1, x2 - x1):
-                            skin_masks[source_index] = cropped_skin
+                        _, crop_box_b, aux = material if len(material) == 3 else (material[0], material[1], {})
+                        face_h = y2 - y1
+                        face_w = x2 - x1
+                        if aux:
+                            xs = max(0, x1 - crop_box_b[0])
+                            ys = max(0, y1 - crop_box_b[1])
+                            xe = min(xs + face_w, aux.get("skin_only", np.zeros((0, 0))).shape[1])
+                            ye = min(ys + face_h, aux.get("skin_only", np.zeros((0, 0))).shape[0])
+                            skin_full = aux.get("skin_only")
+                            if skin_full is not None and skin_full.size:
+                                cropped_skin = skin_full[ys:ye, xs:xe]
+                                skin_masks[source_index] = (
+                                    cropped_skin if cropped_skin.shape == (face_h, face_w) else None
+                                )
+                            else:
+                                skin_masks[source_index] = None
+                            lips_full = aux.get("lips_only")
+                            if lips_full is not None and lips_full.size:
+                                xe_l = min(xs + face_w, lips_full.shape[1])
+                                ye_l = min(ys + face_h, lips_full.shape[0])
+                                cropped_lips = lips_full[ys:ye_l, xs:xe_l]
+                                lips_masks[source_index] = (
+                                    cropped_lips if cropped_lips.shape == (face_h, face_w) else None
+                                )
+                            else:
+                                lips_masks[source_index] = None
                         else:
                             skin_masks[source_index] = None
-                        # Lips mask (mouth interior + upper + lower
-                        # lip, classes 11/12/13). Precise mouth
-                        # region used by the badcase gates and by
-                        # mouth-only post-process steps.
-                        lips_parsing = face_parser(face_large, mode="lips_only")
-                        lips_full = np.array(lips_parsing)
-                        cropped_lips = lips_full[ys:ye, xs:xe]
-                        if cropped_lips.shape == (y2 - y1, x2 - x1):
-                            lips_masks[source_index] = cropped_lips
-                        else:
                             lips_masks[source_index] = None
                     except Exception:
                         skin_masks[source_index] = None
@@ -3509,6 +3539,7 @@ class MuseTalkApiRuntime:
                 if (
                     output_temporal_blend > 0.0
                     and previous_resized is not None
+                    and previous_source_index == source_index
                     and previous_resized.shape == resized.shape
                 ):
                     resized = cv2.addWeighted(
@@ -3519,6 +3550,7 @@ class MuseTalkApiRuntime:
                         0,
                     )
                 previous_resized = resized
+                previous_source_index = source_index
                 # Light color-block check. Compares the upper-face
                 # color distribution between the post-processed
                 # crop and the reference. Tolerates normal per-
@@ -3641,7 +3673,14 @@ class MuseTalkApiRuntime:
                     fallback_reasons["skin_laplacian"] += 1
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
-                mask_array, crop_box = material
+                if len(material) == 3:
+                    mask_array, crop_box, _aux = material
+                else:
+                    # Legacy 2-tuple (pre-parser-merge) -- only
+                    # happens if a hot-reload is in flight; the
+                    # extra parser forward is wasted but the
+                    # pipeline still works.
+                    mask_array, crop_box = material[0], material[1]
                 # Use the lips-only mask for the final paste
                 # so a MuseTalk / CodeFormer failure cannot
                 # bleed into the cheeks / forehead / hair. The
@@ -3874,17 +3913,49 @@ class MuseTalkApiRuntime:
                 raise RuntimeError(detail)
             target_identity = self._find_target_identity(frames, fps, avatar_descriptor, payload)
             if target_identity and target_identity.get("no_face_detected"):
+                frame_count = len(frames)
+                no_face_codeformer = {
+                    "requested": bool(payload.codeformer_enabled),
+                    "fidelity_weight": float(payload.codeformer_fidelity_weight),
+                    "adain": bool(payload.codeformer_adain),
+                    "required": bool(payload.codeformer_required or settings.codeformer_required),
+                    "runtime_available": False,
+                    "runtime_load_error": "",
+                    "checkpoint_path": settings.codeformer_checkpoint_path,
+                    "frames_total": 0,
+                    "frames_enhanced": 0,
+                    "frames_fallback": 0,
+                    "frames_skipped_by_pipeline": 0,
+                    "elapsed_seconds": 0.0,
+                    "error": "no target face detected -- CodeFormer skipped",
+                }
+                no_face_speech_gate = {
+                    "enabled": payload.speech_gate_enabled,
+                    "active_frames": 0,
+                    "silent_frames": 0,
+                }
+                baseline = _lipsync_response_baseline(
+                    payload,
+                    frame_count=frame_count,
+                    fps=fps,
+                    audio_feature_fps=0.0,
+                    speech_gate_stats=no_face_speech_gate,
+                    codeformer_stats=no_face_codeformer,
+                )
                 no_face_response = {
+                    **baseline,
                     "passthrough": True,
                     "passthrough_reason": "no_face_detected",
-                    "source_frame_count": len(frames),
-                    "output_frame_count": len(frames),
-                    "audio_frame_count": 0,
-                    "source_fps": round(float(fps), 6),
-                    "audio_feature_fps": 0.0,
-                    "audio_sync_offset_frames": 0,
-                    "audio_sync_offset_output_frames": 0,
-                    "audio_sync_offset_seconds": payload.audio_sync_offset_seconds,
+                    "skipped_output_frames": frame_count,
+                    "frame_provenance": ["passthrough"] * frame_count,
+                    "target_identity_source": "none",
+                    # Inherited from the main return: per-filter
+                    # counts and provenance breakdown are all 0
+                    # on a no-face passthrough. The baseline
+                    # already sets the LatentSync-style
+                    # zero columns and the request-config echo;
+                    # we only need the no-face-specific bits
+                    # here.
                     "matched_source_frames": 0,
                     "filled_source_frames": 0,
                     "filtered_motion_frames": 0,
@@ -3899,66 +3970,10 @@ class MuseTalkApiRuntime:
                     "generated_output_frames": 0,
                     "quality_fallback_frames": 0,
                     "effective_generated_output_frames": 0,
-                    "skipped_output_frames": len(frames),
-                    "frame_provenance": ["passthrough"] * len(frames),
                     "best_similarity": 0.0,
                     "target_identity_similarity": 0.0,
                     "target_identity_count": 0,
                     "target_identity_coverage": 0.0,
-                    "target_identity_source": "none",
-                    "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
-                    # LatentSync-style stats (always zero on the no-face passthrough).
-                    "pre_skip_frames": 0,
-                    "quality_skip_frames": 0,
-                    "yaw_skip_count": 0,
-                    "yaw_rate_skip_count": 0,
-                    "mouth_occlusion_skip_count": 0,
-                    "motion_blur_skip_count": 0,
-                    "face_jump_skip_count": 0,
-                    "side_face_episode_extra_skip_count": 0,
-                    "side_face_warn_run_skip_count": 0,
-                    "silent_skip_frames": 0,
-                    "skipped_inference_batches": 0,
-                    "skipped_inference_frames": 0,
-                    "effective_guidance_scale": payload.guidance_scale_override,
-                    "effective_inference_steps": payload.inference_steps_override,
-                    "effective_seed": payload.seed_override,
-                    "identity_skip_count": 0,
-                    "identity_similarity_min": 0.0,
-                    "identity_similarity_median": 0.0,
-                    "identity_similarity_max": 0.0,
-                    "identity_similarity_threshold": float(payload.similarity_threshold),
-                    "speech_gate": {
-                        "enabled": payload.speech_gate_enabled,
-                        "active_frames": 0,
-                        "silent_frames": 0,
-                    },
-                    "mouth_temporal": {
-                        "unsupported": True,
-                        "stabilization_strength": float(payload.mouth_temporal_stabilization_strength),
-                        "stabilization_max_delta": float(payload.mouth_temporal_stabilization_max_delta),
-                        "delta_min": 0.0,
-                        "delta_median": 0.0,
-                        "delta_max": 0.0,
-                        "delta_skip_frames": 0,
-                        "stabilized_frames": 0,
-                    },
-                    "codeformer": {
-                        "requested": bool(payload.codeformer_enabled),
-                        "fidelity_weight": float(payload.codeformer_fidelity_weight),
-                        "adain": bool(payload.codeformer_adain),
-                        "required": bool(payload.codeformer_required or settings.codeformer_required),
-                        "runtime_available": False,
-                        "runtime_load_error": "",
-                        "checkpoint_path": settings.codeformer_checkpoint_path,
-                        "frames_total": 0,
-                        "frames_enhanced": 0,
-                        "frames_fallback": 0,
-                        "frames_skipped_by_pipeline": 0,
-                        "elapsed_seconds": 0.0,
-                        "error": "no target face detected -- CodeFormer skipped",
-                    },
-                    "quality_ok": True,
                 }
                 _log_lipsync_report(job_id, no_face_response)
                 return no_face_response
@@ -3971,7 +3986,6 @@ class MuseTalkApiRuntime:
             )
             target_identity_count = int(target_identity["count"]) if target_identity else 0
             target_identity_coverage = float(target_identity.get("identity_coverage", 0.0)) if target_identity else 0.0
-            face_identity_backend = "embedding" if payload.require_face_embedding else "visual"
             target_identity_source = (
                 _describe_target_identity_source(avatar_descriptor, target_identity)
             )
@@ -4149,16 +4163,19 @@ class MuseTalkApiRuntime:
                 payload.speech_gate_post_roll_seconds,
                 payload.speech_gate_fill_gap_seconds,
             )
-            # Count silent frames for the LatentSync-style
-            # ``silent_skip_frames`` stat. When the speech gate is
-            # disabled every frame is "active" by definition, so
-            # silent_skip_frames is 0 and the count matches the
-            # pipeline's observed behavior.
-            if speech_activity_mask:
-                silent_skip_frames = sum(1 for active in speech_activity_mask if not active)
-            else:
-                silent_skip_frames = 0
+            # Count silent frames as we actually skip them during
+            # ``process_items`` construction (below). Computing
+            # the count here keeps ``silent_skip_frames`` aligned
+            # with what the pipeline does -- a previous version
+            # summed ``speech_activity_mask == False`` separately,
+            # which could disagree with the real skip count when
+            # the ``speech_index`` clip or the latent-availability
+            # short-circuit also dropped frames.
+            silent_skip_frames = 0
             if speech_gate_stats is not None and isinstance(speech_gate_stats, dict):
+                # ``active_frames`` is set inside ``_audio_activity_mask``
+                # already; the per-pipeline silent count lands in
+                # ``silent_skip_frames`` after the loop below.
                 speech_gate_stats.setdefault("silent_frames", silent_skip_frames)
             # Summary stats over the per-frame best similarity score.
             # LatentSync publishes min/median/max identity-similarity;
@@ -4184,12 +4201,18 @@ class MuseTalkApiRuntime:
                 )
                 speech_index = min(max(output_index + speech_sync_offset_frames, 0), len(speech_activity_mask) - 1)
                 if speech_activity_mask and not speech_activity_mask[speech_index]:
+                    silent_skip_frames += 1
                     continue
                 source_index = self._source_index_for_output(output_index, len(frames))
                 latent = latents_by_frame.get(source_index)
                 if latent is None:
                     continue
                 process_items.append((output_index, whisper_chunks[audio_index], latent))
+            # Sync the speech-gate ``silent_frames`` stat with the
+            # count we just accumulated, so a single source of
+            # truth flows to both the response and the report log.
+            if speech_gate_stats is not None and isinstance(speech_gate_stats, dict):
+                speech_gate_stats["silent_frames"] = silent_skip_frames
 
             generated = self._run_inference_batches(process_items, payload.batch_size) if process_items else {}
 
@@ -4331,16 +4354,21 @@ class MuseTalkApiRuntime:
             temp_video_path.unlink(missing_ok=True)
 
             skipped_output_frames = output_frame_count - len(generated)
+            baseline = _lipsync_response_baseline(
+                payload,
+                frame_count=output_frame_count,
+                fps=fps,
+                audio_feature_fps=audio_feature_fps,
+                silent_skip_frames=silent_skip_frames,
+                speech_gate_stats=speech_gate_stats,
+                codeformer_stats=codeformer_stats,
+            )
             return {
+                **baseline,
                 "output_path": output_path,
-                "source_frame_count": len(frames),
-                "output_frame_count": output_frame_count,
                 "audio_frame_count": audio_frame_count,
-                "source_fps": round(float(fps), 6),
-                "audio_feature_fps": round(float(audio_feature_fps), 6),
                 "audio_sync_offset_frames": audio_sync_offset_frames,
                 "audio_sync_offset_output_frames": speech_sync_offset_frames,
-                "audio_sync_offset_seconds": payload.audio_sync_offset_seconds,
                 "matched_source_frames": matched_source_frames,
                 "filled_source_frames": filled_source_frames,
                 "filtered_motion_frames": filtered_motion_frames,
@@ -4361,71 +4389,112 @@ class MuseTalkApiRuntime:
                 "quality_fallback_reasons": fallback_reasons,
                 "effective_generated_output_frames": max(0, len(generated) - quality_fallback_frames),
                 "skipped_output_frames": skipped_output_frames,
-                # Per-frame provenance: "passthrough" / "generated" /
-                # "quality_fallback" / "blend_error". Length always
-                # equals output_frame_count so callers can correlate
-                # it with frame indices and audio alignment.
                 "frame_provenance": frame_provenance,
                 "best_similarity": max(best_scores) if best_scores else 0.0,
                 "target_identity_similarity": target_identity_score,
                 "target_identity_count": target_identity_count,
                 "target_identity_coverage": target_identity_coverage,
                 "target_identity_source": target_identity_source,
-                "face_identity_backend": face_identity_backend,
-                "speech_gate": speech_gate_stats,
-                # --- LatentSync-style per-frame filter / pre-skip stats ---
-                # MuseTalk's encoder-decoder pipeline does not perform
-                # yaw / occlusion / motion-blur / face-jump / side-face
-                # episode filtering -- those knobs are diffusion-only and
-                # are accepted on the wire but ignored at runtime (see
-                # ``_log_unsupported_fields``). We report zeros so
-                # cross-backend dashboards have stable columns.
-                "pre_skip_frames": 0,
-                "quality_skip_frames": 0,
-                "yaw_skip_count": 0,
-                "yaw_rate_skip_count": 0,
-                "mouth_occlusion_skip_count": 0,
-                "motion_blur_skip_count": 0,
-                "face_jump_skip_count": 0,
-                "side_face_episode_extra_skip_count": 0,
-                "side_face_warn_run_skip_count": 0,
-                "silent_skip_frames": silent_skip_frames,
-                "skipped_inference_batches": 0,
-                "skipped_inference_frames": 0,
-                # --- LatentSync-style inference overrides (no-op in MuseTalk) ---
-                "effective_guidance_scale": payload.guidance_scale_override,
-                "effective_inference_steps": payload.inference_steps_override,
-                "effective_seed": payload.seed_override,
-                # --- Per-frame identity similarity summary (matches the
-                #     LatentSync response schema; computed from
-                #     ``best_scores`` collected during target selection). ---
-                "identity_skip_count": 0,
+                # The baseline already set ``identity_similarity_min``
+                # / median / max to 0.0; override with the real
+                # values computed earlier in this scope. The
+                # baseline also set ``identity_similarity_threshold``
+                # from ``payload`` so we keep that echo.
                 "identity_similarity_min": identity_similarity_min,
                 "identity_similarity_median": identity_similarity_median,
                 "identity_similarity_max": identity_similarity_max,
-                "identity_similarity_threshold": float(payload.similarity_threshold),
-                # --- Mouth temporal stabilization (diffusion-only stat) ---
-                # MuseTalk is a single-step encoder-decoder; there is no
-                # per-frame delta to stabilize. We echo the request
-                # settings back so the dashboard's "current run config"
-                # panel still shows the caller's intent, and mark the
-                # block unsupported so consumers can branch on it.
-                "mouth_temporal": {
-                    "unsupported": True,
-                    "stabilization_strength": float(payload.mouth_temporal_stabilization_strength),
-                    "stabilization_max_delta": float(payload.mouth_temporal_stabilization_max_delta),
-                    "delta_min": 0.0,
-                    "delta_median": 0.0,
-                    "delta_max": 0.0,
-                    "delta_skip_frames": 0,
-                    "stabilized_frames": 0,
-                },
-                "codeformer": codeformer_stats,
-                "quality_ok": True,
             }
 
 
 runtime = MuseTalkApiRuntime()
+
+
+def _lipsync_response_baseline(
+    payload: LipSyncRequest,
+    frame_count: int,
+    fps: float,
+    audio_feature_fps: float = 0.0,
+    silent_skip_frames: int = 0,
+    speech_gate_stats: Optional[Dict[str, object]] = None,
+    codeformer_stats: Optional[Dict[str, object]] = None,
+) -> Dict[str, object]:
+    """Common skeleton for every ``/api/lipsync`` response.
+
+    Both the main ``synthesize`` return and the no-face-detected
+    passthrough build a near-identical dict (frame counts, audio
+    offset echoes, LatentSync-style "always-zero" columns,
+    request-config echoes). Centralising that skeleton here keeps
+    the two return sites in sync: if a new field lands, adding
+    it once is enough for both branches to pick it up.
+
+    The caller supplies the few per-run values (frame counts,
+    audio_feature_fps, silent_skip_frames) and the structured
+    blocks that already come from elsewhere in the pipeline
+    (``speech_gate_stats``, ``codeformer_stats``). Everything
+    else is derived from ``payload`` so a request-time echo of
+    a Pydantic knob lands in the response without manual
+    repetition.
+    """
+    require_embedding = bool(payload.require_face_embedding)
+    baseline: Dict[str, object] = {
+        # Frame / audio alignment echoes.
+        "source_frame_count": frame_count,
+        "output_frame_count": frame_count,
+        "audio_frame_count": 0,
+        "source_fps": round(float(fps), 6),
+        "audio_feature_fps": round(float(audio_feature_fps), 6),
+        "audio_sync_offset_frames": 0,
+        "audio_sync_offset_output_frames": 0,
+        "audio_sync_offset_seconds": payload.audio_sync_offset_seconds,
+        # LatentSync-style per-frame filter / pre-skip stats. MuseTalk
+        # is encoder-decoder, not diffusion, so these are zero --
+        # exposing stable columns lets cross-backend dashboards
+        # compare apples to apples.
+        "pre_skip_frames": 0,
+        "quality_skip_frames": 0,
+        "yaw_skip_count": 0,
+        "yaw_rate_skip_count": 0,
+        "mouth_occlusion_skip_count": 0,
+        "motion_blur_skip_count": 0,
+        "face_jump_skip_count": 0,
+        "side_face_episode_extra_skip_count": 0,
+        "side_face_warn_run_skip_count": 0,
+        "silent_skip_frames": int(silent_skip_frames),
+        "skipped_inference_batches": 0,
+        "skipped_inference_frames": 0,
+        # LatentSync-style inference overrides (no-op in MuseTalk --
+        # echoed back so dashboards can show caller intent).
+        "effective_guidance_scale": payload.guidance_scale_override,
+        "effective_inference_steps": payload.inference_steps_override,
+        "effective_seed": payload.seed_override,
+        # Per-frame identity similarity summary -- left at 0 here
+        # because the baseline does not have access to best_scores;
+        # the main return overrides these with the real values.
+        "identity_skip_count": 0,
+        "identity_similarity_min": 0.0,
+        "identity_similarity_median": 0.0,
+        "identity_similarity_max": 0.0,
+        "identity_similarity_threshold": float(payload.similarity_threshold),
+        "face_identity_backend": "embedding" if require_embedding else "visual",
+        # Mouth temporal stabilization (diffusion-only) -- echo the
+        # settings, mark the block unsupported.
+        "mouth_temporal": {
+            "unsupported": True,
+            "stabilization_strength": float(payload.mouth_temporal_stabilization_strength),
+            "stabilization_max_delta": float(payload.mouth_temporal_stabilization_max_delta),
+            "delta_min": 0.0,
+            "delta_median": 0.0,
+            "delta_max": 0.0,
+            "delta_skip_frames": 0,
+            "stabilized_frames": 0,
+        },
+        "quality_ok": True,
+    }
+    if speech_gate_stats is not None:
+        baseline["speech_gate"] = speech_gate_stats
+    if codeformer_stats is not None:
+        baseline["codeformer"] = codeformer_stats
+    return baseline
 
 
 def _output_url(request: Request, output_path: Path) -> str:
@@ -4598,8 +4667,14 @@ def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str,
 
 @app.post("/api/lipsync")
 def create_lipsync(payload: LipSyncRequest, request: Request) -> Dict[str, object]:
-    if payload.parsing_mode not in {"jaw", "raw", "lips_only", "lips_outer_only"}:
-        raise HTTPException(status_code=400, detail="parsing_mode must be 'jaw', 'raw', 'lips_only', or 'lips_outer_only'")
+    # ``LipSyncRequest.parsing_mode`` is a Pydantic ``Literal``,
+    # so unknown values are rejected at validation time with a
+    # 422 before this handler runs. The ``assert`` below is a
+    # belt-and-braces check that would only fire if the
+    # ``Literal`` list ever drifts from the runtime check here
+    # -- it keeps the two in sync without runtime cost on the
+    # happy path.
+    assert payload.parsing_mode in {"jaw", "raw", "lips_only", "lips_outer_only"}
 
     job_id = uuid.uuid4().hex
     job_input_dir = INPUT_ROOT / job_id

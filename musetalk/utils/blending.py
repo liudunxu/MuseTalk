@@ -118,6 +118,7 @@ def get_image_prepare_material(
     mode="raw",
     mask_blur_ratio=0.1,
     lips_dilation=0,
+    aux_modes=("lips_only", "skin_only"),
 ):
     """Build the blend mask and expanded crop box for paste-back.
 
@@ -133,6 +134,19 @@ def get_image_prepare_material(
     only) and excludes the mouth interior (11), so the source's
     open-mouth dark area is not overwritten by the model's wider
     dark interior.
+
+    The function runs BiSeNet **at most once** for the face crop
+    on this frame. The legacy implementation called
+    ``face_seg(face_large, mode=mode)`` here and then the
+    caller re-invoked the parser two more times on the same
+    crop for ``skin_only`` and ``lips_only`` -- 3 forwards per
+    source frame. Now we ask the parser for the raw class map
+    once via ``parse_classes`` and derive the primary mask plus
+    any ``aux_modes`` (e.g. ``lips_only``, ``skin_only``) from
+    it via ``_build_mode_mask``. The returned ``aux`` dict maps
+    mode name -> uint8 mask of the same shape as the primary
+    mask; pass an empty tuple to skip the extra numpy work
+    entirely.
     """
     body = Image.fromarray(image[:,:,::-1])
 
@@ -144,7 +158,27 @@ def get_image_prepare_material(
     face_large = body.crop(crop_box)
     ori_shape = face_large.size
 
-    mask_image = face_seg(face_large, mode=mode, fp=fp)
+    # Single BiSeNet forward. From this class map we build the
+    # primary mask (post-blend-mask pipeline) AND any auxiliary
+    # masks the caller requested -- a typical request asks for
+    # ("lips_only", "skin_only") so the post-process pipeline can
+    # do color match / detail restore / badcase gates without
+    # re-running the network.
+    if fp is None or not hasattr(fp, "parse_classes"):
+        # Fallback: legacy path that re-runs the parser per call.
+        # Kept so unit tests / direct callers that pass a duck-
+        # typed ``fp`` still work.
+        mask_image = face_seg(face_large, mode=mode, fp=fp)
+        aux: dict = {}
+    else:
+        parsing = fp.parse_classes(face_large)
+        aux = {
+            aux_mode: fp._build_mode_mask(parsing, aux_mode)
+            for aux_mode in aux_modes
+        }
+        primary = fp._build_mode_mask(parsing, mode)
+        mask_image = Image.fromarray(primary)
+
     mask_small = mask_image.crop((x-x_s, y-y_s, x1-x_s, y1-y_s))
     mask_image = Image.new('L', ori_shape, 0)
     mask_image.paste(mask_small, (x-x_s, y-y_s, x1-x_s, y1-y_s))
@@ -164,7 +198,7 @@ def get_image_prepare_material(
         if mask_blur_ratio > 0:
             blur_kernel_size = int(mask_blur_ratio * ori_shape[0] // 2 * 2) + 1
             mask_array = cv2.GaussianBlur(mask_array, (blur_kernel_size, blur_kernel_size), 0)
-        return mask_array, crop_box
+        return mask_array, crop_box, aux
 
     # keep upper_boundary_ratio of talking area
     width, height = mask_image.size
@@ -176,4 +210,4 @@ def get_image_prepare_material(
     if mask_blur_ratio > 0:
         blur_kernel_size = int(mask_blur_ratio * ori_shape[0] // 2 * 2) + 1
         mask_array = cv2.GaussianBlur(mask_array, (blur_kernel_size, blur_kernel_size), 0)
-    return mask_array, crop_box
+    return mask_array, crop_box, aux

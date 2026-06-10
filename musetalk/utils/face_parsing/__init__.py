@@ -74,6 +74,83 @@ class FaceParsing():
             transforms.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
         ])
 
+    def parse_classes(self, image, size=(512, 512)) -> np.ndarray:
+        """Run BiSeNet once and return the per-pixel class index
+        array (H, W) of dtype uint8 with values in 0..18. Use this
+        when the caller needs more than one region mask
+        (lips_only / skin_only / jaw / ...) from the same frame so
+        the network forward is only paid once.
+
+        Image resize and BiSeNet forward follow the same path as
+        ``__call__``; the per-mode post-processing is intentionally
+        omitted here -- callers derive masks via ``np.isin`` or
+        re-use ``_build_mode_mask`` below.
+        """
+        if isinstance(image, str):
+            image = Image.open(image)
+        with torch.no_grad():
+            image = image.resize(size, Image.BILINEAR)
+            img = self.preprocess(image)
+            if torch.cuda.is_available():
+                img = torch.unsqueeze(img, 0).cuda()
+            else:
+                img = torch.unsqueeze(img, 0)
+            out = self.net(img)[0]
+            parsing = out.squeeze(0).cpu().numpy().argmax(0)
+        return parsing.astype(np.uint8)
+
+    def _build_mode_mask(self, parsing: np.ndarray, mode: str) -> np.ndarray:
+        """Pure-numpy mask builder for the legacy ``__call__`` modes.
+        Given a pre-computed ``parsing`` array (output of
+        ``parse_classes``), return the same uint8 mask that
+        ``__call__(image, mode=mode)`` would have produced. Used
+        to keep ``__call__`` and the cached-single-forward path
+        in sync -- any new mode added here must be added to both.
+        """
+        if mode == "neck":
+            out = np.zeros_like(parsing)
+            out[np.isin(parsing, [1, 11, 12, 13, 14])] = 255
+            return out
+        if mode == "jaw":
+            # Same cone + cheek geometry as the legacy __call__.
+            face_region = (np.isin(parsing, [1]) * 255).astype(np.uint8)
+            original_dilated = cv2.dilate(face_region, self.kernel, iterations=1)
+            eroded = cv2.erode(original_dilated, self.cheek_kernel, iterations=2)
+            face_region = cv2.bitwise_and(eroded, self.cheek_mask)
+            face_region = cv2.bitwise_or(face_region, cv2.bitwise_and(original_dilated, ~self.cheek_mask))
+            out = np.zeros_like(parsing)
+            out[(face_region == 255) & (~np.isin(parsing, [10]))] = 255
+            out[np.isin(parsing, [11, 12, 13])] = 255
+            return out
+        if mode == "skin_only":
+            return (np.isin(parsing, [1]) * 255).astype(np.uint8)
+        if mode == "lips_only":
+            # Mouth interior (11) + upper lip (12) + lower lip
+            # (13). Precise lip / mouth / teeth mask used by
+            # badcase gates (mouth laplacian, mouth drift) and
+            # by mouth-only post-process (CLAHE, mouth->skin
+            # color match) when we want to exclude eyes / brows
+            # / nose from the mouth mask. The earlier
+            # "not-skin" approximation (`skin_mask < 128`)
+            # included eyes and brows which dragged the badcase
+            # gates' signal toward non-mouth features.
+            return (np.isin(parsing, [11, 12, 13]) * 255).astype(np.uint8)
+        if mode == "lips_outer_only":
+            # Lip vermilion only (upper lip 12 + lower lip 13).
+            # Excludes the mouth interior (11) so the open-
+            # mouth dark area is NOT synthesized -- the
+            # source's mouth interior is kept. Use this when
+            # the source is closed-mouth and the model would
+            # otherwise generate a wider dark interior than
+            # the source has. Tightest lips mode; useful as
+            # ``parsing_mode`` for the blend mask when even
+            # ``lips_only`` reads as too wide.
+            return (np.isin(parsing, [12, 13]) * 255).astype(np.uint8)
+        # raw / default: face skin + mouth
+        out = np.zeros_like(parsing)
+        out[np.isin(parsing, [1, 11, 12, 13])] = 255
+        return out
+
     def __call__(self, image, size=(512, 512), mode="raw"):
         if isinstance(image, str):
             image = Image.open(image)
@@ -88,56 +165,16 @@ class FaceParsing():
                 img = torch.unsqueeze(img, 0)
             out = self.net(img)[0]
             parsing = out.squeeze(0).cpu().numpy().argmax(0)
-            
-            # Add 14:neck, remove 10:nose and 7:8:9
-            if mode == "neck":
-                parsing[np.isin(parsing, [1, 11, 12, 13, 14])] = 255
-                parsing[np.where(parsing!=255)] = 0
-            elif mode == "jaw":
-                face_region = np.isin(parsing, [1])*255
-                face_region = face_region.astype(np.uint8)
-                original_dilated = cv2.dilate(face_region, self.kernel, iterations=1)
-                eroded = cv2.erode(original_dilated, self.cheek_kernel, iterations=2)
-                face_region = cv2.bitwise_and(eroded, self.cheek_mask)
-                face_region = cv2.bitwise_or(face_region, cv2.bitwise_and(original_dilated, ~self.cheek_mask))
-                parsing[(face_region==255) & (~np.isin(parsing, [10]))] = 255
-                parsing[np.isin(parsing, [11, 12, 13])] = 255
-                parsing[np.where(parsing!=255)] = 0
-            elif mode == "skin_only":
-                # Skin (class 1) only -- exclude lips / mouth / nose /
-                # eyes / brows. Used by post-process steps that need
-                # a precise "cheek + forehead + jaw" mask (e.g.
-                # reference detail restore) so they do not apply the
-                # reference's closed-mouth high-frequency detail to
-                # generated open-mouth area.
-                parsing = (np.isin(parsing, [1]) * 255).astype(np.uint8)
-            elif mode == "lips_only":
-                # Mouth interior (11) + upper lip (12) + lower lip
-                # (13). Precise lip / mouth / teeth mask used by
-                # badcase gates (mouth laplacian, mouth drift) and
-                # by mouth-only post-process (CLAHE, mouth->skin
-                # color match) when we want to exclude eyes / brows
-                # / nose from the mouth mask. The earlier
-                # "not-skin" approximation (`skin_mask < 128`)
-                # included eyes and brows which dragged the badcase
-                # gates' signal toward non-mouth features.
-                parsing = (np.isin(parsing, [11, 12, 13]) * 255).astype(np.uint8)
-            elif mode == "lips_outer_only":
-                # Lip vermilion only (upper lip 12 + lower lip 13).
-                # Excludes the mouth interior (11) so the open-
-                # mouth dark area is NOT synthesized -- the
-                # source's mouth interior is kept. Use this when
-                # the source is closed-mouth and the model would
-                # otherwise generate a wider dark interior than
-                # the source has. Tightest lips mode; useful as
-                # ``parsing_mode`` for the blend mask when even
-                # ``lips_only`` reads as too wide.
-                parsing = (np.isin(parsing, [12, 13]) * 255).astype(np.uint8)
-            else:
-                parsing[np.isin(parsing, [1, 11, 12, 13])] = 255
-                parsing[np.where(parsing!=255)] = 0
 
-        parsing = Image.fromarray(parsing.astype(np.uint8))
+        # Single source of truth: build the mask from the parsing
+        # array via the shared numpy helper. The legacy inline
+        # per-mode branches used to live here; they were moved to
+        # ``_build_mode_mask`` so the cached-forward path in
+        # ``get_image_prepare_material`` re-uses the exact same
+        # post-processing logic.
+        mask_array = self._build_mode_mask(parsing, mode)
+
+        parsing = Image.fromarray(mask_array.astype(np.uint8))
         return parsing
 
 if __name__ == "__main__":
