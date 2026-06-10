@@ -550,14 +550,29 @@ class LipSyncRequest(BaseModel):
         description="Run CodeFormer face restoration on the aligned face crops before paste-back.",
     )
     codeformer_fidelity_weight: float = Field(
-        0.5,
+        0.7,
         ge=0.0,
         le=1.0,
         description="CodeFormer fidelity weight. 0 = sharpest (most codebook-driven, identity drift), "
-                    "1 = closest to input. Default 0.5 = middle ground: keeps enough inpainter "
-                    "detail to preserve lipsync shape, but lets CodeFormer clean up obvious color "
-                    "blocks. Lower (0.2-0.4) for sharper teeth/lips at the cost of codebook "
-                    "deviation; higher (0.7-0.9) to stay closer to the inpainter's output.",
+                    "1 = closest to input. Default 0.7 keeps the restored face close to the "
+                    "inpainter's output so per-frame variation stays low (the source of the "
+                    "flicker CodeFormer 0.5 produced). The remaining color block fix is carried "
+                    "by the per-frame post-process (skin-only detail restore, mouth->skin color "
+                    "match, mouth CLAHE) so the fidelity bump does not lose the cleanup. "
+                    "Lower (0.4-0.6) for stronger restoration if you also enable "
+                    "codeformer_temporal_alpha to tame the flicker. Higher (0.85-0.95) almost "
+                    "disables CodeFormer while keeping its safeguard path.",
+    )
+    codeformer_temporal_alpha: float = Field(
+        0.7,
+        ge=0.0,
+        le=1.0,
+        description="Cross-frame EMA on the CodeFormer-restored face crops. After the model "
+                    "restores each face, blend it with the previous frame's restored face at "
+                    "this ratio (alpha = current, 1-alpha = previous). 1.0 disables (raw "
+                    "CodeFormer output, may flicker). 0.5-0.7 dampens the per-frame "
+                    "variation that causes flicker without lagging lipsync too much. Set 0 "
+                    "to skip the EMA (legacy behavior).",
     )
     codeformer_adain: bool = Field(
         True,
@@ -4087,14 +4102,38 @@ class MuseTalkApiRuntime:
                         fidelity_weight=payload.codeformer_fidelity_weight,
                         adain=payload.codeformer_adain,
                     )
-                    # Write restored faces back into the generated dict as BGR uint8,
-                    # resizing from 512x512 back to the original face crop size.
+                    # Cross-frame EMA on the CodeFormer-restored
+                    # crops. CodeFormer is a per-frame model with
+                    # no temporal constraint, so on a real
+                    # lipsync input the restored output flickers
+                    # frame-to-frame. Mixing each restored crop
+                    # with the previous one in sorted-index order
+                    # damps the variation without lagging the
+                    # lipsync motion too much (alpha 0.7 keeps
+                    # 70% of the current frame). Sorted-index
+                    # order is the natural play order of the
+                    # video; the EMA chain walks through it.
                     restored_np = restored_batch.cpu().numpy()
+                    cf_alpha = float(payload.codeformer_temporal_alpha)
+                    prev_restored: Optional[np.ndarray] = None
                     for i, idx in enumerate(sorted_indices):
                         face_out = restored_np[i]  # (3, 512, 512) in [-1, 1]
                         face_out = np.transpose(face_out, (1, 2, 0))  # (512, 512, 3) RGB
                         face_out = ((face_out + 1.0) / 2.0 * 255.0)
                         face_out = np.clip(face_out, 0, 255).astype(np.uint8)
+                        if (
+                            cf_alpha < 1.0
+                            and prev_restored is not None
+                            and prev_restored.shape == face_out.shape
+                        ):
+                            face_out = cv2.addWeighted(
+                                face_out,
+                                cf_alpha,
+                                prev_restored,
+                                1.0 - cf_alpha,
+                                0,
+                            )
+                        prev_restored = face_out
                         face_out = face_out[..., ::-1]  # RGB -> BGR
                         orig_h, orig_w = original_sizes[i]
                         if face_out.shape[0] != orig_h or face_out.shape[1] != orig_w:
