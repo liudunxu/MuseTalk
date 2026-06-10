@@ -261,7 +261,7 @@ class LipSyncRequest(BaseModel):
     blend_mask_blur_ratio: float = Field(0.015, ge=0.0, le=0.2)
     color_match_strength: float = Field(0.70, ge=0.0, le=1.0)
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
-    mouth_sharpen_strength: float = Field(0.40, ge=0.0, le=1.0)
+    mouth_sharpen_strength: float = Field(0.30, ge=0.0, le=1.0)
     mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default.
@@ -1083,24 +1083,6 @@ class MuseTalkApiRuntime:
             checkpoint_path=settings.codeformer_checkpoint_path,
             device=device,
             batch_size=settings.codeformer_batch_size,
-            # Internal fallback thresholds (CodeFormer self-checks
-            # the restored crop against the input on sharpness and
-            # pixel diff, and falls back to the input on any
-            # outlier). The defaults in CodeFormerRestorer were
-            # designed for general face restoration where the
-            # model output should be close to the input. For
-            # MuseTalk lipsync, the model output is *supposed* to
-            # differ from the source frame (the mouth is moving
-            # with the audio), so the default thresholds fire
-            # constantly and the model effectively never gets to
-            # clean up anything. Loosen the thresholds so the
-            # model has room to actually restore, but keep the
-            # safeguard enabled so OOM / model collapse still
-            # gets caught.
-            fallback_sharpness_low=0.3,
-            fallback_sharpness_high=3.0,
-            fallback_pixel_diff=0.35,
-            fallback_mouth_diff=0.30,
         )
         # Eagerly probe the load so we surface errors early.
         if not settings.codeformer_checkpoint_path or not os.path.isfile(settings.codeformer_checkpoint_path):
