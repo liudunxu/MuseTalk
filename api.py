@@ -288,56 +288,53 @@ class LipSyncRequest(BaseModel):
     quality_min_sharpness_ratio: float = Field(0.03, ge=0.0, le=1.0)
     # Mouth sharpness floor. Catches the "mouth is completely
     # smudged" badcase (CodeFormer / MuseTalk / VAE failure):
-    # the lips come out as a single low-variance blob. Default
-    # 5.0 catches 0.5-5 smudges while tolerating normal 50-200
-    # lip motion. 0 disables. The default went 5.0 -> 0 in an
-    # earlier round because the metric was applied to a
-    # 32x32 tile and over-fired; here it is applied to the
-    # BiSeNet lips-only mask so it actually targets the mouth.
+    # the lips come out as a single low-variance blob. 0
+    # disables (default). Enable per request when diagnosing a
+    # specific blurry-mouth badcase; keeping it off by default
+    # avoids dropping normal low-texture / motion-blurred lip
+    # frames.
     quality_min_mouth_laplacian: float = Field(
-        5.0,
+        0.0,
         ge=0.0,
         le=2000.0,
-        description="Mouth-ROI Laplacian floor (applied to the BiSeNet lips mask). Default 5.0 catches a smudged mouth. 0 disables.",
+        description="Mouth-ROI Laplacian floor (applied to the BiSeNet lips mask). 0 (default) disables.",
     )
-    # Mouth vs reference drift. Catches the "generated mouth
-    # does not match the source face" badcase (identity drift,
-    # severe color block, post-process over-shift). Compares
-    # the lips-mask MSE between the post-processed crop and
-    # the reference. Default 500 catches a clearly different
-    # mouth; raise to 800-1500 to be permissive, lower to
-    # 200-300 to be strict. 0 disables.
+    # Mouth vs reference drift. Compares the lips-mask MSE
+    # between the post-processed crop and the reference. This is
+    # useful as a strict debugging gate for identity drift or
+    # severe color blocks, but it is too coarse for the default
+    # path because correct lipsync intentionally changes the
+    # mouth pixels. 0 disables (default).
     quality_max_mouth_drift_mse: float = Field(
-        500.0,
+        0.0,
         ge=0.0,
         le=10000.0,
-        description="Lips-mask MSE ceiling vs reference. Default 500 catches identity-drift / severe color block badcases. 0 disables.",
+        description="Lips-mask MSE ceiling vs reference. 0 (default) disables; enable per request for strict badcase debugging.",
     )
     # Skin drift. Catches the "generated face extends past the
     # mouth" badcase (MuseTalk / CodeFormer failure that
     # bleeds the inpainter output into the cheek / forehead /
     # hair). Compares the skin-mask MSE between the post-
-    # processed crop and the reference. Default 200 catches a
-    # skin region that was modified by the pipeline. Raise to
-    # 400-800 to be permissive, lower to 80-150 to be strict.
-    # 0 disables.
+    # processed crop and the reference. 0 disables (default).
+    # The final paste is lips-only when the parser provides a
+    # lips mask, so skin drift in the intermediate crop should
+    # not reject otherwise usable mouth frames by default.
     quality_max_skin_drift_mse: float = Field(
-        200.0,
+        0.0,
         ge=0.0,
         le=10000.0,
-        description="Skin-mask MSE ceiling vs reference. Default 200 catches frames where the pipeline modified the cheeks / forehead / jaw. 0 disables.",
+        description="Skin-mask MSE ceiling vs reference. 0 (default) disables; enable per request for strict badcase debugging.",
     )
     # Skin sharpness floor. Catches the "skin became a
     # uniform color blob" badcase (CodeFormer over-smoothing
     # the cheeks, color-match clipping the entire face to a
     # single tone). The face parser's skin mask is the region
-    # to inspect. Default 5.0 catches a blurred skin patch.
-    # 0 disables.
+    # to inspect. 0 disables (default).
     quality_min_skin_laplacian: float = Field(
-        5.0,
+        0.0,
         ge=0.0,
         le=2000.0,
-        description="Skin-ROI Laplacian floor. Default 5.0 catches a smudged skin patch. 0 disables.",
+        description="Skin-ROI Laplacian floor. 0 (default) disables.",
     )
     # Mouth-region postfilter. Catches a single large blurry patch
     # in the generated mouth (CodeFormer failure, VAE collapse)
@@ -3622,13 +3619,14 @@ class MuseTalkApiRuntime:
                     provenance[output_index] = blend_status
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
-                # --- Badcase gates (lips / skin drift) ---
+                # --- Optional badcase gates (lips / skin drift) ---
                 # These four gates answer "did the pipeline
-                # produce a frame we should NOT ship?" and
-                # default-on per the user's "宁可对该帧使用
-                # 原帧" policy. All four use the BiSeNet
-                # lips / skin mask, so they are precise about
-                # the region they inspect.
+                # produce a frame we should NOT ship?" All four
+                # use the BiSeNet lips / skin mask, so they are
+                # precise about the region they inspect. They are
+                # opt-in because lipsync intentionally changes the
+                # mouth pixels, and the final paste is lips-only
+                # when a lips mask is available.
                 if (
                     lips_mask is not None
                     and quality_min_mouth_laplacian > 0.0
