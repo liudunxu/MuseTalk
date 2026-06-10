@@ -3301,6 +3301,7 @@ class MuseTalkApiRuntime:
                     > quality_max_face_color_histogram_distance
                 ):
                     blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 # Drift fallback. Compares the post-processed face
@@ -3319,6 +3320,7 @@ class MuseTalkApiRuntime:
                     > quality_max_face_outside_mouth_mse
                 ):
                     blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 if (
@@ -3327,6 +3329,7 @@ class MuseTalkApiRuntime:
                     > quality_max_face_tile_mse
                 ):
                     blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 # Mouth-region postfilter. Catches a single large
@@ -3340,6 +3343,7 @@ class MuseTalkApiRuntime:
                     < quality_mouth_min_laplacian
                 ):
                     blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 if quality_gate_enabled and self._is_low_quality_generation(
@@ -3349,6 +3353,7 @@ class MuseTalkApiRuntime:
                     quality_min_sharpness_ratio,
                 ):
                     blend_status = "quality_fallback"
+                    provenance[output_index] = blend_status
                     cv2.imwrite(str(output_dir / f"{output_index:08d}.png"), original_frame)
                     continue
                 mask_array, crop_box = material
