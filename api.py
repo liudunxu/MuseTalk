@@ -253,18 +253,29 @@ class LipSyncRequest(BaseModel):
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     lipsync_min_segment_frames: int = Field(1, ge=1, le=300)
     lipsync_min_face_area_ratio: float = Field(0.005, ge=0.0, le=1.0)
-    # Per-segment all-or-nothing enforcement.  When True
+    # Per-segment consistency enforcement.  When True
     # (default), a contiguous run of frames where the target
-    # face is detectable is forced to be all-passthrough if
-    # any frame in the run fell back to passthrough /
-    # quality-fallback / blend-error.  This prevents the
-    # visible "jump" the user saw when an isolated frame in
-    # the middle of a generated segment fell back to the
-    # unmodified source.  Set to False to keep the legacy
-    # mixed-segment behavior.
+    # face is detectable is checked for "mixed" content
+    # (some generated, some passthrough / quality-fallback
+    # / blend-error).  When the passthrough ratio in a
+    # segment exceeds ``segment_consistency_passthrough_ratio``
+    # (default 0.5 -- "passthrough is the majority"), the
+    # whole segment is forced to passthrough so the run is
+    # uniform.  Segments where generated is the majority
+    # are left alone so as many frames as possible are
+    # synthesized.  This catches the worst case (long
+    # passthrough runs interrupted by 1-2 generated frames)
+    # without sacrificing mostly-generated segments to a
+    # single bad frame.
     segment_consistency_enforced: bool = Field(
         True,
-        description="Force a contiguous run of target-detectable frames to be all-passthrough if any frame in the run fell back. Prevents visible frame-to-frame jumps.",
+        description="Enforce per-segment consistency by rewriting minority-passthrough segments. See segment_consistency_passthrough_ratio.",
+    )
+    segment_consistency_passthrough_ratio: float = Field(
+        0.5,
+        ge=0.0,
+        le=1.0,
+        description="When a segment's passthrough frame ratio is >= this, force the whole segment to passthrough. 0.0 = force on any passthrough (strict), 1.0 = never force.",
     )
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
@@ -3490,6 +3501,7 @@ class MuseTalkApiRuntime:
         quality_max_skin_drift_mse: float,
         quality_min_skin_laplacian: float,
         segment_consistency_enforced: bool,
+        segment_consistency_passthrough_ratio: float,
         face_parser: Optional[FaceParsing],
     ) -> Tuple[List[str], Dict[str, int]]:
         """Write every output frame to ``output_dir`` and return a
@@ -3908,7 +3920,8 @@ class MuseTalkApiRuntime:
         # mixed frames flicker.
         if segment_consistency_enforced:
             enforced = self._enforce_segment_consistency(
-                provenance, targets, frames, write_frame
+                provenance, targets, frames, write_frame,
+                passthrough_ratio=segment_consistency_passthrough_ratio,
             )
             fallback_reasons["segment_consistency"] = enforced
         return provenance, fallback_reasons
@@ -3919,30 +3932,22 @@ class MuseTalkApiRuntime:
         targets: List[Dict[str, object]],
         frames: List[np.ndarray],
         write_frame,
+        passthrough_ratio: float = 0.5,
     ) -> int:
         """For each contiguous "valid" run (every frame in the run
-        had a detectable target face), if the run is mixed
-        (some generated, some passthrough / quality_fallback /
-        blend_error), rewrite the generated frames with the
-        source frame so the whole run becomes passthrough.
+        had a detectable target face), check the run's
+        passthrough ratio.  When the ratio is >= ``passthrough_ratio``
+        (default 0.5 -- "passthrough is the majority"), the
+        whole run is forced to passthrough by rewriting the
+        generated frames with the source frame.  Segments where
+        generated is the majority are left alone so as many
+        frames as possible get synthesized.
+
         Returns the count of frames rewritten this way.
         """
         if not provenance or not targets:
             return 0
 
-        # ``provenance`` is indexed by output frame index.
-        # ``targets`` is indexed by source frame index.  The
-        # synthesize loop maps each output_index to a
-        # source_index via ``_source_index_for_output``; we
-        # need the same mapping here.  When the audio drives
-        # the output frame count, the source_index lookup is
-        # 1:1 in the simple case; in the duplicated/retimed
-        # case the source_index for output_index i is the
-        # same i-th element of ``targets`` after clamping to
-        # the source frame count.  The synthesize loop's
-        # source_index lookup is the only thing that
-        # determines what bbox was used for which output
-        # frame, so mirror it here.
         n = len(provenance)
         rewritten = 0
         index = 0
@@ -3964,14 +3969,25 @@ class MuseTalkApiRuntime:
             segment_end = index
             # Check consistency within [segment_start, segment_end).
             segment_provenance = provenance[segment_start:segment_end]
+            segment_length = len(segment_provenance)
+            if segment_length == 0:
+                continue
             generated_count = sum(
                 1 for status in segment_provenance if status == "generated"
             )
-            passthrough_count = len(segment_provenance) - generated_count
-            if generated_count > 0 and passthrough_count > 0:
-                # Mixed segment.  Force all to passthrough by
-                # rewriting the generated frames with the
-                # source frame.
+            passthrough_count = segment_length - generated_count
+            # Force all to passthrough only when passthrough is
+            # strictly the majority.  Mostly-generated segments
+            # stay as is so the dominant (good) content ships;
+            # the few passthrough frames in the middle are less
+            # jarring than dropping the whole segment.  Ties
+            # (exactly at the threshold) go to "leave alone" so
+            # the user keeps any synthesized frames they already
+            # have.
+            if (
+                passthrough_count > segment_length / 2
+                and passthrough_count / segment_length > passthrough_ratio
+            ):
                 for frame_index in range(segment_start, segment_end):
                     if provenance[frame_index] != "generated":
                         continue
@@ -4590,6 +4606,7 @@ class MuseTalkApiRuntime:
                 payload.quality_max_skin_drift_mse,
                 payload.quality_min_skin_laplacian,
                 payload.segment_consistency_enforced,
+                payload.segment_consistency_passthrough_ratio,
                 face_parser,
             )
             quality_fallback_frames = sum(
