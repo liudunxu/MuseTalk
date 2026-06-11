@@ -253,6 +253,19 @@ class LipSyncRequest(BaseModel):
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     lipsync_min_segment_frames: int = Field(1, ge=1, le=300)
     lipsync_min_face_area_ratio: float = Field(0.005, ge=0.0, le=1.0)
+    # Per-segment all-or-nothing enforcement.  When True
+    # (default), a contiguous run of frames where the target
+    # face is detectable is forced to be all-passthrough if
+    # any frame in the run fell back to passthrough /
+    # quality-fallback / blend-error.  This prevents the
+    # visible "jump" the user saw when an isolated frame in
+    # the middle of a generated segment fell back to the
+    # unmodified source.  Set to False to keep the legacy
+    # mixed-segment behavior.
+    segment_consistency_enforced: bool = Field(
+        True,
+        description="Force a contiguous run of target-detectable frames to be all-passthrough if any frame in the run fell back. Prevents visible frame-to-frame jumps.",
+    )
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
     # Pydantic ``Literal`` rejects unknown values at validation
@@ -3476,6 +3489,7 @@ class MuseTalkApiRuntime:
         quality_max_mouth_drift_mse: float,
         quality_max_skin_drift_mse: float,
         quality_min_skin_laplacian: float,
+        segment_consistency_enforced: bool,
         face_parser: Optional[FaceParsing],
     ) -> Tuple[List[str], Dict[str, int]]:
         """Write every output frame to ``output_dir`` and return a
@@ -3517,6 +3531,7 @@ class MuseTalkApiRuntime:
             "mouth_drift_mse": 0,
             "skin_drift_mse": 0,
             "skin_laplacian": 0,
+            "segment_consistency": 0,
             "other": 0,
         }
         previous_resized: Optional[np.ndarray] = None
@@ -3877,7 +3892,95 @@ class MuseTalkApiRuntime:
                 )
             provenance[output_index] = blend_status
             write_frame(output_index, combined)
+        # --- Segment consistency enforcement ---
+        # A mixed segment (some generated, some passthrough /
+        # quality-fallback within the same speaker's contiguous
+        # valid run) causes a visible "jump" in the output video
+        # because the source face and the model-blended face
+        # differ slightly.  Walk the provenance list, find the
+        # contiguous segments of frames where the target face
+        # was detectable (bbox != None), and force each such
+        # segment to be all-passthrough when it has any
+        # non-generated frame in it.  The user explicitly chose
+        # "rather not move the mouth, but be natural" -- so when
+        # the segment is not pure-generated, drop the model
+        # output for the whole segment instead of letting a few
+        # mixed frames flicker.
+        if segment_consistency_enforced:
+            enforced = self._enforce_segment_consistency(
+                provenance, targets, frames, write_frame
+            )
+            fallback_reasons["segment_consistency"] = enforced
         return provenance, fallback_reasons
+
+    @staticmethod
+    def _enforce_segment_consistency(
+        provenance: List[str],
+        targets: List[Dict[str, object]],
+        frames: List[np.ndarray],
+        write_frame,
+    ) -> int:
+        """For each contiguous "valid" run (every frame in the run
+        had a detectable target face), if the run is mixed
+        (some generated, some passthrough / quality_fallback /
+        blend_error), rewrite the generated frames with the
+        source frame so the whole run becomes passthrough.
+        Returns the count of frames rewritten this way.
+        """
+        if not provenance or not targets:
+            return 0
+
+        # ``provenance`` is indexed by output frame index.
+        # ``targets`` is indexed by source frame index.  The
+        # synthesize loop maps each output_index to a
+        # source_index via ``_source_index_for_output``; we
+        # need the same mapping here.  When the audio drives
+        # the output frame count, the source_index lookup is
+        # 1:1 in the simple case; in the duplicated/retimed
+        # case the source_index for output_index i is the
+        # same i-th element of ``targets`` after clamping to
+        # the source frame count.  The synthesize loop's
+        # source_index lookup is the only thing that
+        # determines what bbox was used for which output
+        # frame, so mirror it here.
+        n = len(provenance)
+        rewritten = 0
+        index = 0
+        while index < n:
+            # Skip leading passthroughs (frames where bbox is
+            # None).  These are already consistent.
+            source_index = min(index, len(targets) - 1)
+            if targets[source_index].get("bbox") is None:
+                index += 1
+                continue
+            # Found a valid frame -- find the contiguous run
+            # of valid frames.
+            segment_start = index
+            while index < n:
+                source_index = min(index, len(targets) - 1)
+                if targets[source_index].get("bbox") is None:
+                    break
+                index += 1
+            segment_end = index
+            # Check consistency within [segment_start, segment_end).
+            segment_provenance = provenance[segment_start:segment_end]
+            generated_count = sum(
+                1 for status in segment_provenance if status == "generated"
+            )
+            passthrough_count = len(segment_provenance) - generated_count
+            if generated_count > 0 and passthrough_count > 0:
+                # Mixed segment.  Force all to passthrough by
+                # rewriting the generated frames with the
+                # source frame.
+                for frame_index in range(segment_start, segment_end):
+                    if provenance[frame_index] != "generated":
+                        continue
+                    source_index = min(frame_index, len(targets) - 1)
+                    source_index = min(source_index, len(frames) - 1)
+                    write_frame(frame_index, frames[source_index])
+                    provenance[frame_index] = "passthrough"
+                    rewritten += 1
+        return rewritten
 
     def _frames_to_video(self, frames_dir: Path, fps: float, temp_video_path: Path) -> None:
         subprocess.run(
@@ -4486,6 +4589,7 @@ class MuseTalkApiRuntime:
                 payload.quality_max_mouth_drift_mse,
                 payload.quality_max_skin_drift_mse,
                 payload.quality_min_skin_laplacian,
+                payload.segment_consistency_enforced,
                 face_parser,
             )
             quality_fallback_frames = sum(
