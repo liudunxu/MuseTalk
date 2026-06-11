@@ -550,10 +550,10 @@ class LipSyncRequest(BaseModel):
     # ghosting on fast motion. Raise to 0.20-0.30 for heavier
     # smoothing; lower toward 0 if you see trailing.
     output_temporal_blend: float = Field(
-        0.12,
+        0.25,
         ge=0.0,
         le=0.9,
-        description="Output-level temporal blend with the previous frame. 0.12 (default) for light smoothing.",
+        description="Output-level temporal blend with the previous frame. 0.25 (default) for medium smoothing -- dampens per-frame flicker without heavy ghosting on speech motion.",
     )
     # Side-face / fast-turn prefilters (diffusion-only). MuseTalk does
     # not currently implement yaw-based skipping; values are accepted
@@ -3701,10 +3701,23 @@ class MuseTalkApiRuntime:
                 # content jitter that bbox smoothing alone cannot
                 # fix (bbox position is stable, but the generated
                 # mouth shape / texture still shakes between
-                # frames). 0 disables. Default 0 = current per-
-                # frame behavior; per-request 0.2-0.3 is a light
-                # smooth, 0.4-0.5 is heavy and may ghost on fast
-                # motion.
+                # frames).
+                #
+                # Gate: the old version used a hard ``delta <= 0.16``
+                # cutoff -- any real speech motion (e.g. a 'P' ->
+                # 'AH' phoneme transition that pushes mean-abs
+                # mouth delta past 0.16) disabled the blend
+                # entirely, which is the OPPOSITE of what you want
+                # for stability.  Now we taper smoothly: at
+                # delta <= 0.10 we use the full requested blend,
+                # at delta >= 0.30 we skip the blend (only very
+                # large motion -- head turns, scene cuts -- skips),
+                # and in between we smoothstep the blend weight
+                # down.  Combined with the raised default
+                # (0.25) this means the user gets a stable lip
+                # surface across real speech motion without the
+                # ghosting that a hard blend would cause on the
+                # rare big-motion frame.
                 if (
                     output_temporal_blend > 0.0
                     and previous_resized is not None
@@ -3712,7 +3725,7 @@ class MuseTalkApiRuntime:
                     and source_index - previous_source_index in (0, 1)
                     and previous_resized.shape == resized.shape
                 ):
-                    temporal_ok = True
+                    effective_blend = output_temporal_blend
                     if lips_mask is not None and lips_mask.shape == resized.shape[:2]:
                         mouth_sel = lips_mask > 128
                         if int(mouth_sel.sum()) >= 16:
@@ -3720,13 +3733,22 @@ class MuseTalkApiRuntime:
                                 resized.astype(np.float32)
                                 - previous_resized.astype(np.float32)
                             )[mouth_sel].mean() / 255.0
-                            temporal_ok = mouth_delta <= 0.16
-                    if temporal_ok:
+                            # Smoothstep taper: full blend at
+                            # delta <= 0.10, no blend at delta
+                            # >= 0.30.
+                            delta_lo, delta_hi = 0.10, 0.30
+                            if mouth_delta >= delta_hi:
+                                effective_blend = 0.0
+                            elif mouth_delta > delta_lo:
+                                t = (mouth_delta - delta_lo) / (delta_hi - delta_lo)
+                                smooth_t = t * t * (3.0 - 2.0 * t)
+                                effective_blend *= (1.0 - smooth_t)
+                    if effective_blend > 1e-6:
                         resized = cv2.addWeighted(
                             resized,
-                            1.0 - output_temporal_blend,
+                            1.0 - effective_blend,
                             previous_resized,
-                            output_temporal_blend,
+                            effective_blend,
                             0,
                         )
                 previous_resized = resized
