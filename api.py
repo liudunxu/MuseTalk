@@ -277,6 +277,22 @@ class LipSyncRequest(BaseModel):
         le=1.0,
         description="When a segment's passthrough frame ratio is >= this, force the whole segment to passthrough. 0.0 = force on any passthrough (strict), 1.0 = never force.",
     )
+    # Time-window segment merging.  When two contiguous valid
+    # runs are separated by a passthrough gap shorter than
+    # this many seconds, treat them as one segment for the
+    # consistency check.  This absorbs brief detector jitter
+    # / head turns / occlusions inside an otherwise
+    # generated speaker run, so the merged segment still
+    # scores as "mostly generated" and survives.  0.0 =
+    # disable merging (back to strict contiguous behavior).
+    # 1.0-1.5s catches typical per-frame detector misses
+    # without bridging real scene cuts.
+    segment_consistency_merge_window_seconds: float = Field(
+        1.0,
+        ge=0.0,
+        le=10.0,
+        description="Time window (seconds) for merging close valid segments before the consistency majority vote. 0 = strict contiguous, 1.0 = default.",
+    )
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
     # Pydantic ``Literal`` rejects unknown values at validation
@@ -3502,6 +3518,8 @@ class MuseTalkApiRuntime:
         quality_min_skin_laplacian: float,
         segment_consistency_enforced: bool,
         segment_consistency_passthrough_ratio: float,
+        segment_consistency_merge_window_seconds: float,
+        source_fps: float,
         face_parser: Optional[FaceParsing],
     ) -> Tuple[List[str], Dict[str, int]]:
         """Write every output frame to ``output_dir`` and return a
@@ -3922,6 +3940,8 @@ class MuseTalkApiRuntime:
             enforced = self._enforce_segment_consistency(
                 provenance, targets, frames, write_frame,
                 passthrough_ratio=segment_consistency_passthrough_ratio,
+                merge_window_seconds=segment_consistency_merge_window_seconds,
+                source_fps=source_fps,
             )
             fallback_reasons["segment_consistency"] = enforced
         return provenance, fallback_reasons
@@ -3933,42 +3953,78 @@ class MuseTalkApiRuntime:
         frames: List[np.ndarray],
         write_frame,
         passthrough_ratio: float = 0.5,
+        merge_window_seconds: float = 0.0,
+        source_fps: float = 25.0,
     ) -> int:
         """For each contiguous "valid" run (every frame in the run
         had a detectable target face), check the run's
-        passthrough ratio.  When the ratio is >= ``passthrough_ratio``
-        (default 0.5 -- "passthrough is the majority"), the
-        whole run is forced to passthrough by rewriting the
-        generated frames with the source frame.  Segments where
-        generated is the majority are left alone so as many
-        frames as possible get synthesized.
+        passthrough ratio.  When the ratio exceeds
+        ``passthrough_ratio`` (default 0.5 -- "passthrough is
+        the majority"), the whole run is forced to passthrough
+        by rewriting the generated frames with the source
+        frame.  Segments where generated is the majority are
+        left alone so as many frames as possible get
+        synthesized.
+
+        When ``merge_window_seconds`` > 0, contiguous valid
+        runs separated by a gap of fewer than that many
+        seconds are merged into a single run before the
+        majority vote.  This is the "speaker smoothing"
+        knob the user asked for: a brief passthrough gap
+        (detector jitter, occluded frame, short head turn)
+        inside an otherwise generated speaker segment is
+        absorbed into the surrounding generated content
+        instead of starting a new segment that would be
+        rated as "mostly passthrough" and dropped.
 
         Returns the count of frames rewritten this way.
         """
         if not provenance or not targets:
             return 0
 
+        # Step 1: collect raw contiguous valid segments.
         n = len(provenance)
-        rewritten = 0
+        raw_segments: List[Tuple[int, int]] = []  # (start, end_exclusive)
         index = 0
         while index < n:
-            # Skip leading passthroughs (frames where bbox is
-            # None).  These are already consistent.
             source_index = min(index, len(targets) - 1)
             if targets[source_index].get("bbox") is None:
                 index += 1
                 continue
-            # Found a valid frame -- find the contiguous run
-            # of valid frames.
-            segment_start = index
+            seg_start = index
             while index < n:
                 source_index = min(index, len(targets) - 1)
                 if targets[source_index].get("bbox") is None:
                     break
                 index += 1
-            segment_end = index
-            # Check consistency within [segment_start, segment_end).
-            segment_provenance = provenance[segment_start:segment_end]
+            raw_segments.append((seg_start, index))
+
+        if not raw_segments:
+            return 0
+
+        # Step 2: merge segments that are within merge_window_seconds.
+        if merge_window_seconds > 0.0 and source_fps > 0.0:
+            merge_window_frames = max(1, int(round(merge_window_seconds * source_fps)))
+            merged: List[Tuple[int, int]] = [raw_segments[0]]
+            for seg_start, seg_end in raw_segments[1:]:
+                prev_start, prev_end = merged[-1]
+                gap = seg_start - prev_end
+                if gap <= merge_window_frames:
+                    # Bridge the gap: extend the previous segment
+                    # to cover the gap and the new segment.  The
+                    # frames in the gap had bbox=None so they
+                    # were passthrough -- they'll be counted in
+                    # the merged-segment stats below.
+                    merged[-1] = (prev_start, seg_end)
+                else:
+                    merged.append((seg_start, seg_end))
+        else:
+            merged = raw_segments
+
+        # Step 3: majority vote per merged segment.
+        rewritten = 0
+        for seg_start, seg_end in merged:
+            segment_provenance = provenance[seg_start:seg_end]
             segment_length = len(segment_provenance)
             if segment_length == 0:
                 continue
@@ -3977,18 +4033,14 @@ class MuseTalkApiRuntime:
             )
             passthrough_count = segment_length - generated_count
             # Force all to passthrough only when passthrough is
-            # strictly the majority.  Mostly-generated segments
-            # stay as is so the dominant (good) content ships;
-            # the few passthrough frames in the middle are less
-            # jarring than dropping the whole segment.  Ties
-            # (exactly at the threshold) go to "leave alone" so
-            # the user keeps any synthesized frames they already
-            # have.
+            # strictly the majority.  Ties go to "leave alone"
+            # so the user keeps whatever synthesized frames
+            # they already have.
             if (
                 passthrough_count > segment_length / 2
                 and passthrough_count / segment_length > passthrough_ratio
             ):
-                for frame_index in range(segment_start, segment_end):
+                for frame_index in range(seg_start, seg_end):
                     if provenance[frame_index] != "generated":
                         continue
                     source_index = min(frame_index, len(targets) - 1)
@@ -4607,6 +4659,8 @@ class MuseTalkApiRuntime:
                 payload.quality_min_skin_laplacian,
                 payload.segment_consistency_enforced,
                 payload.segment_consistency_passthrough_ratio,
+                payload.segment_consistency_merge_window_seconds,
+                fps,
                 face_parser,
             )
             quality_fallback_frames = sum(
