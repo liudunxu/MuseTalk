@@ -649,6 +649,23 @@ class FaceListRequest(BaseModel):
     min_landmark_points: int = Field(8, ge=1, le=68)
     min_landmark_overlap: float = Field(0.08, ge=0.0, le=1.0)
     crop_padding: float = Field(0.8, ge=0.0, le=1.5)
+    # Filter to only return face clusters whose mouth was
+    # visibly open at some sampled frame during the scan.
+    # ``mouth_motion_max_openness`` is the highest
+    # dark-pixel ratio observed in the mouth region across
+    # all frames that hit the cluster. A closed-mouth face
+    # (listener, profile glance, etc.) typically scores
+    # < 0.08; an open-mouth face with visible cavity scores
+    # 0.15-0.50. Default 0.10 drops most silent faces
+    # (listener / side face) while keeping any face that
+    # visibly spoke. Set to 0.0 to disable the filter and
+    # return every distinct face.
+    min_mouth_openness: float = Field(
+        0.10,
+        ge=0.0,
+        le=1.0,
+        description="Drop clusters whose max mouth-region dark-pixel ratio across the scan is below this. 0 disables; default 0.10 drops silent faces.",
+    )
 
 
 app = FastAPI(title="MuseTalk lip-sync API")
@@ -1659,6 +1676,49 @@ class MuseTalkApiRuntime:
             return crop
         return None
 
+    @staticmethod
+    def _compute_mouth_openness(
+        frame: np.ndarray, bbox: Tuple[int, int, int, int]
+    ) -> float:
+        """Estimate how open the mouth is, in [0.0, 1.0].
+
+        Uses a simple dark-pixel ratio in the lower face region:
+        the mouth is taken as the lower-middle third of the bbox
+        (typical mouth location under a frontal face detector),
+        converted to HSV, and we return the fraction of pixels
+        with V < 80. A closed mouth (lip line only) scores
+        0.02-0.08; an open mouth showing dark cavity scores
+        0.15-0.50; a wide-open shout can reach 0.6+.
+
+        This is intentionally cheap (no extra model forward) so
+        we can score every detected face at every sampled
+        frame. The threshold is exposed to the caller via
+        ``FaceListRequest.min_mouth_openness``; 0.10 is a
+        reasonable default that keeps visible speakers and
+        drops silent / listener faces.
+        """
+        x1, y1, x2, y2 = bbox
+        h, w = y2 - y1, x2 - x1
+        if h <= 0 or w <= 0:
+            return 0.0
+        # Lower 40% of the bbox, horizontally the middle 60%.
+        my1 = y1 + int(h * 0.60)
+        my2 = y2
+        mx1 = x1 + int(w * 0.20)
+        mx2 = x2 - int(w * 0.20)
+        if my2 - my1 < 4 or mx2 - mx1 < 4:
+            return 0.0
+        region = frame[my1:my2, mx1:mx2]
+        if region.size == 0:
+            return 0.0
+        hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+        v = hsv[:, :, 2]
+        # Count "dark" pixels (potential cavity / open mouth
+        # interior). 80 is well below typical lip color (which
+        # sits in the 100-160 range on most face crops) and
+        # well above the noise floor on dark skin.
+        return float((v < 80).mean())
+
     def _passes_face_filters(
         self,
         frame: np.ndarray,
@@ -1726,6 +1786,9 @@ class MuseTalkApiRuntime:
         crop = self._crop_face(frame, bbox, crop_padding)
         if crop is None:
             return
+        # Score mouth openness for the silent-face filter. Cheap
+        # enough to run on every accepted detection.
+        mouth_openness = self._compute_mouth_openness(frame, bbox)
 
         best_cluster = None
         best_score = -1.0
@@ -1747,6 +1810,7 @@ class MuseTalkApiRuntime:
                     "first_frame_index": frame_index,
                     "first_area": area,
                     "count": 1,
+                    "mouth_motion_max_openness": mouth_openness,
                 }
             )
             return
@@ -1761,6 +1825,10 @@ class MuseTalkApiRuntime:
             best_cluster["best_bbox"] = bbox
             best_cluster["best_frame_index"] = frame_index
             best_cluster["best_detection_score"] = detection_score
+        if mouth_openness > float(
+            best_cluster.get("mouth_motion_max_openness", 0.0)
+        ):
+            best_cluster["mouth_motion_max_openness"] = mouth_openness
 
     def extract_distinct_faces(
         self,
@@ -1843,6 +1911,23 @@ class MuseTalkApiRuntime:
                 key=lambda item: (int(item["count"]), int(item["max_area"])),
                 reverse=True,
             )
+            # Drop silent clusters: faces whose mouth never visibly
+            # opened during the scan. Default threshold 0.10 keeps
+            # visible speakers and drops listeners / side-glance
+            # faces. Set ``min_mouth_openness=0`` on the request to
+            # disable.
+            rejected_silent = 0
+            if payload.min_mouth_openness > 0.0:
+                kept_clusters = []
+                for cluster in clusters:
+                    openness = float(
+                        cluster.get("mouth_motion_max_openness", 0.0)
+                    )
+                    if openness < payload.min_mouth_openness:
+                        rejected_silent += 1
+                        continue
+                    kept_clusters.append(cluster)
+                clusters = kept_clusters
             faces_dir = output_dir / "faces"
             faces_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1869,6 +1954,9 @@ class MuseTalkApiRuntime:
                         "frame_index": int(cluster["best_frame_index"]),
                         "detection_score": float(cluster["best_detection_score"]),
                         "count": int(cluster["count"]),
+                        "mouth_motion_max_openness": float(
+                            cluster.get("mouth_motion_max_openness", 0.0)
+                        ),
                     }
                 )
 
@@ -1884,6 +1972,7 @@ class MuseTalkApiRuntime:
                 "rejected_landmark_count": rejected_landmarks,
                 "rejected_embedding_count": rejected_embedding,
                 "rejected_avatar_crop_count": rejected_avatar_crop,
+                "rejected_silent_face_count": rejected_silent,
                 "face_identity_backend": "embedding" if payload.require_face_embedding else "visual",
             }
 
@@ -4712,6 +4801,7 @@ def list_distinct_faces(payload: FaceListRequest, request: Request) -> Dict[str,
                 "frame_index": item["frame_index"],
                 "detection_score": item["detection_score"],
                 "count": item["count"],
+                "mouth_motion_max_openness": item["mouth_motion_max_openness"],
             }
         )
 
