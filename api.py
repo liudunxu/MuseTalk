@@ -3204,6 +3204,7 @@ class MuseTalkApiRuntime:
         lips_mask: Optional[np.ndarray],
         skin_mask: Optional[np.ndarray] = None,
         strength: float = 0.45,
+        stats_mask: Optional[np.ndarray] = None,
     ) -> np.ndarray:
         """Color-match the generated mouth to the reference's
         skin tone.
@@ -3229,6 +3230,22 @@ class MuseTalkApiRuntime:
         lips-only mask and a default 0.30 strength, exposed
         as a Pydantic knob (mouth_color_match_strength) so
         callers can relax or strengthen it per request.
+
+        ``stats_mask`` (optional) selects which pixels to use
+        for the mean / std statistics.  When ``None`` the
+        function falls back to ``lips_mask`` (the legacy
+        behaviour: classes 11 + 12 + 13, i.e. mouth interior
+        + upper-lip + lower-lip).  The caller should pass the
+        ``lips_outer_only`` mask (classes 12 + 13 -- lip
+        vermilion only) so the dark open-mouth cavity
+        (class 11) does NOT drag ``gen_mean`` / ``gen_std``
+        -- and therefore the upper-lip color correction --
+        toward a darker target.  The blend mask (used for
+        the final alpha composition) still uses the full
+        ``lips_mask`` so the open-mouth cavity also receives
+        the color correction.  See commit message for the
+        symptom (synthesized upper-lip reading darker than
+        the source).
         """
         if strength <= 0.0 or image.size == 0 or reference.size == 0:
             return image
@@ -3244,6 +3261,21 @@ class MuseTalkApiRuntime:
         mouth_mask = (lips_mask > 128)
         if int(mouth_mask.sum()) < 100:
             return image
+        # Statistics mask: when provided, use it for the
+        # mean / std computation instead of the full
+        # ``mouth_mask``. Must be the same shape as the
+        # image and not empty. If too few pixels survive,
+        # silently fall back to the legacy full-lips stats
+        # so we never divide by zero or compute on a
+        # vacuous sample.
+        if stats_mask is not None and stats_mask.shape == image.shape[:2]:
+            stats_pixels_mask = (stats_mask > 128) & mouth_mask
+            if int(stats_pixels_mask.sum()) >= 100:
+                stats_pixels = image[stats_pixels_mask]
+            else:
+                stats_pixels = image[mouth_mask]
+        else:
+            stats_pixels = image[mouth_mask]
         reference_mask = None
         if skin_mask is not None and skin_mask.shape == image.shape[:2]:
             skin_reference_mask = (skin_mask > 128) & ~mouth_mask
@@ -3256,9 +3288,8 @@ class MuseTalkApiRuntime:
             return image
         ref_mean = ref_pixels.mean(axis=0)
         ref_std = ref_pixels.std(axis=0)
-        gen_mouth_pixels = image[mouth_mask]
-        gen_mean = gen_mouth_pixels.mean(axis=0)
-        gen_std = gen_mouth_pixels.std(axis=0)
+        gen_mean = stats_pixels.mean(axis=0)
+        gen_std = stats_pixels.std(axis=0)
         scale = ref_std / np.maximum(gen_std, 1.0)
         shift = ref_mean - gen_mean * scale
         image_float = image.astype(np.float32)
@@ -3601,6 +3632,14 @@ class MuseTalkApiRuntime:
         blend_materials: Dict[int, Optional[Tuple[np.ndarray, Tuple[int, int, int, int]]]] = {}
         skin_masks: Dict[int, Optional[np.ndarray]] = {}
         lips_masks: Dict[int, Optional[np.ndarray]] = {}
+        # Same parser forward as ``lips_masks`` but excluding the
+        # mouth interior (BiSeNet class 11). Used by the
+        # ``_match_mouth_to_skin_tone`` statistics so the dark
+        # open-mouth cavity does not drag the gen_mean / gen_std
+        # -- and therefore the upper-lip color correction --
+        # toward the cavity's lower brightness. See the function
+        # docstring for the full rationale.
+        lips_outer_masks: Dict[int, Optional[np.ndarray]] = {}
         # Per-gate fallback counters. Reported back so the
         # [LipSync-report] log line shows which badcase
         # classification fired how many times.
@@ -3678,7 +3717,14 @@ class MuseTalkApiRuntime:
                             mode=parsing_mode,
                             mask_blur_ratio=blend_mask_blur_ratio,
                             lips_dilation=lips_blend_dilation,
-                            aux_modes=("lips_only", "skin_only"),
+                            # ``lips_outer_only`` (12+13 only) is
+                            # added so the mouth color-match stats
+                            # can be anchored to lip vermilion
+                            # without the open-mouth cavity (11)
+                            # pulling them darker. No extra
+                            # BiSeNet forward -- same parsing
+                            # array is sliced into multiple masks.
+                            aux_modes=("lips_only", "lips_outer_only", "skin_only"),
                         )
                         blend_materials[source_index] = (
                             mask_array,
@@ -3708,6 +3754,7 @@ class MuseTalkApiRuntime:
                 # safe.
                 skin_mask: Optional[np.ndarray] = None
                 lips_mask: Optional[np.ndarray] = None
+                lips_outer_mask: Optional[np.ndarray] = None
                 if source_index not in skin_masks:
                     try:
                         _, crop_box_b, aux = material if len(material) == 3 else (material[0], material[1], {})
@@ -3736,14 +3783,37 @@ class MuseTalkApiRuntime:
                                 )
                             else:
                                 lips_masks[source_index] = None
+                            # ``lips_outer_only`` (12+13) is the
+                            # companion mask used as the statistics
+                            # anchor for the mouth color match; the
+                            # post-process blend still uses the full
+                            # ``lips_only`` (11+12+13) so the open-
+                            # mouth cavity also receives the color
+                            # correction.  Same shape contract as
+                            # ``lips_masks`` -- crop slice into the
+                            # face-crop size, ``None`` if the slice
+                            # does not match.
+                            outer_full = aux.get("lips_outer_only")
+                            if outer_full is not None and outer_full.size:
+                                xe_o = min(xs + face_w, outer_full.shape[1])
+                                ye_o = min(ys + face_h, outer_full.shape[0])
+                                cropped_outer = outer_full[ys:ye_o, xs:xe_o]
+                                lips_outer_masks[source_index] = (
+                                    cropped_outer if cropped_outer.shape == (face_h, face_w) else None
+                                )
+                            else:
+                                lips_outer_masks[source_index] = None
                         else:
                             skin_masks[source_index] = None
                             lips_masks[source_index] = None
+                            lips_outer_masks[source_index] = None
                     except Exception:
                         skin_masks[source_index] = None
                         lips_masks[source_index] = None
+                        lips_outer_masks[source_index] = None
                 skin_mask = skin_masks.get(source_index)
                 lips_mask = lips_masks.get(source_index)
+                lips_outer_mask = lips_outer_masks.get(source_index)
                 resized = self._match_color_stats(resized, reference_crop, color_match_strength)
                 # Pull the generated mouth's mean / std toward
                 # the reference's skin tone. After this the
@@ -3756,6 +3826,13 @@ class MuseTalkApiRuntime:
                     resized, reference_crop, lips_mask,
                     skin_mask=skin_mask,
                     strength=mouth_color_match_strength,
+                    # Anchor the mean / std to lip vermilion
+                    # only (12 + 13) so the dark open-mouth
+                    # cavity (11) does not darken the upper-lip
+                    # correction. The blend mask above still
+                    # uses the full ``lips_mask`` so the
+                    # cavity also gets the color correction.
+                    stats_mask=lips_outer_mask,
                 )
                 resized = self._restore_reference_detail(
                     resized, reference_crop, mouth_detail_strength, skin_mask=skin_mask
