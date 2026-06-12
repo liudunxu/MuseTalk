@@ -27,7 +27,7 @@ fi
 # train.py: Training script
 # --config: Path to the training configuration file
 echo "Starting $STAGE training..."
-accelerate launch --config_file ./configs/training/gpu.yaml \
+uv run accelerate launch --config_file ./configs/training/gpu.yaml \
                   --main_process_port 29502 \
                   train.py --config ./configs/training/$STAGE.yaml
 

@@ -1,0 +1,115 @@
+[project]
+name = "musetalk"
+version = "1.5.0"
+description = "Real-time high-fidelity video dubbing via spatio-temporal sampling"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10,<3.12"
+authors = [
+    { name = "TMElyralab" },
+]
+keywords = ["lip-sync", "video-dubbing", "musetalk", "diffusion", "audio-driven"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+]
+
+dependencies = [
+    # Core deep-learning stack
+    "torch>=2.0.0,<2.6.0",
+    "torchvision>=0.15.0,<0.21.0",
+    "diffusers==0.30.2",
+    "transformers==4.39.2",
+    "accelerate==0.28.0",
+    "huggingface-hub==0.30.2",
+    "einops==0.8.1",
+
+    # Numerics / image / audio
+    "numpy>=1.23.5,<2.0.0",
+    "opencv-python==4.9.0.80",
+    "Pillow",
+    "scipy",
+    "soundfile==0.12.1",
+    "librosa==0.11.0",
+
+    # Web UI / API
+    "fastapi",
+    "uvicorn",
+    "gradio==5.24.0",
+    "pydantic",
+
+    # Video / media processing
+    "imageio[ffmpeg]",
+    "moviepy>=1.0.3,<2.0.0",
+    "ffmpeg-python",
+    "decord",
+
+    # Configuration / utilities
+    "omegaconf",
+    "tqdm",
+    "requests",
+    "gdown",
+    "regex",
+    "more-itertools",
+
+    # Face / pose preprocessing
+    "mmpose",
+    "insightface",
+    "onnxruntime",
+    # MMLab ecosystem (required by mmpose at runtime)
+    "mmengine",
+    "mmcv>=2.0.0,<2.1.0",
+    "mmdet>=3.0.0,<3.2.0",
+]
+
+[project.optional-dependencies]
+# GPU-backed ONNXRuntime for server deployments with CUDA.
+# Install with: uv sync --extra gpu
+gpu = [
+    "onnxruntime-gpu",
+]
+
+# Training-only extras (tensorboard logging, etc.)
+train = [
+    "tensorboard",
+]
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.urls]
+Homepage = "https://github.com/TMElyralab/MuseTalk"
+Repository = "https://github.com/TMElyralab/MuseTalk"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["musetalk"]
+
+[tool.uv]
+default-groups = ["dev"]
+
+[tool.uv.extra-build-dependencies]
+chumpy = ["pip"]
+mmcv = ["setuptools<80"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = ["E402", "E501", "F401", "F403", "F405"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

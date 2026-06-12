@@ -145,9 +145,33 @@ We also hope you note that we have not verified, maintained, or updated third-pa
 ### [ComfyUI](https://github.com/chaojie/ComfyUI-MuseTalk)
 
 ## Installation
-To prepare the Python environment and install additional packages such as opencv, diffusers, mmcv, etc., please follow the steps below:
+To prepare the Python environment and install additional packages such as opencv, diffusers, mmcv, etc., please follow the steps below.
 
-### Build environment
+This project uses [uv](https://github.com/astral-sh/uv) for dependency management. If you prefer the legacy conda/pip workflow, it is still documented below.
+
+### Using uv (recommended)
+
+1. Install uv if you haven't already:
+   ```shell
+   curl -LsSf https://astral.sh/uv/install.sh | sh
+   ```
+
+2. Sync dependencies. This creates a virtual environment (`.venv`) and installs everything declared in `pyproject.toml`:
+   ```shell
+   uv sync
+   ```
+   On a CUDA server, also install the GPU extra for ONNXRuntime:
+   ```shell
+   uv sync --extra gpu
+   ```
+   For training, include the training extra:
+   ```shell
+   uv sync --extra train
+   ```
+
+3. Run commands through `uv run` (examples below). `uv run` automatically uses the project environment.
+
+### Build environment (legacy conda/pip)
 We recommend Python 3.10 and CUDA 11.7. Set up your environment as follows:
 
 ```shell
@@ -155,7 +179,7 @@ conda create -n MuseTalk python==3.10
 conda activate MuseTalk
 ```
 
-### Install PyTorch 2.0.1
+### Install PyTorch 2.0.1 (legacy)
 Choose one of the following installation methods:
 
 ```shell
@@ -166,15 +190,15 @@ pip install torch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 --index-url https
 conda install pytorch==2.0.1 torchvision==0.15.2 torchaudio==2.0.2 pytorch-cuda=11.8 -c pytorch -c nvidia
 ```
 
-### Install Dependencies
+### Install Dependencies (legacy)
 Install the remaining required packages:
 
 ```shell
 pip install -r requirements.txt
 ```
 
-### Install MMLab Packages
-Install the MMLab ecosystem packages:
+### Install MMLab Packages (legacy)
+When using conda/pip, the MMLab ecosystem packages should be installed manually:
 
 ```bash
 pip install --no-cache-dir -U openmim
@@ -183,6 +207,8 @@ mim install "mmcv==2.0.1"
 mim install "mmdet==3.1.0"
 mim install "mmpose==1.1.0"
 ```
+
+> Note: With `uv sync`, `mmcv`, `mmdet`, `mmengine`, and `mmpose` are already declared in `pyproject.toml` and installed automatically.
 
 ### Setup FFmpeg
 1. [Download](https://github.com/BtbN/FFmpeg-Builds/releases) the ffmpeg-static package
