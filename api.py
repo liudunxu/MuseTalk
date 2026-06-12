@@ -293,6 +293,43 @@ class LipSyncRequest(BaseModel):
         le=10.0,
         description="Time window (seconds) for merging close valid segments before the consistency majority vote. 0 = strict contiguous, 1.0 = default.",
     )
+    # Hard-cut / track-switch gate inside the merge window.  When
+    # a hard cut is detected inside the passthrough gap between
+    # two valid runs, refuse to merge them so a speaker switch
+    # never gets bridged by a short passthrough.  See
+    # docs/heygen_like_lipsync_segmentation_td.md §5.1.
+    segment_consistency_hard_cut_enabled: bool = Field(
+        True,
+        description="When True, refuse to merge two contiguous valid runs if a hard cut is detected in the gap. See docs/.../heygen_like_lipsync_segmentation_td.md §5.1.",
+    )
+    segment_consistency_hard_cut_distance_threshold: float = Field(
+        0.65,
+        ge=0.0,
+        le=2.0,
+        description="Face-crop histogram distance above which a frame boundary is treated as a hard cut / track switch. 0.65 is conservative (obvious cuts only); 0 disables the per-frame check. See docs §5.1.",
+    )
+    # Track-aware merge.  Pre-scans the target sequence and
+    # assigns a track_id to each frame based on face-crop
+    # continuity.  When two runs have different track_ids the
+    # merge is refused even if the gap is short.  Falls back to
+    # time-window merge when track_id is missing.  See
+    # docs/.../heygen_like_lipsync_segmentation_td.md §5.5.
+    segment_consistency_track_aware: bool = Field(
+        True,
+        description="When True, only merge runs whose track_id matches. Falls back to time-window merge when track_id is missing. See docs/.../heygen_like_lipsync_segmentation_td.md §5.5.",
+    )
+    # Post-merge minimum duration.  After the majority vote,
+    # any merged segment whose total length is below this many
+    # seconds is forced entirely to passthrough to avoid the
+    # splice artifacts that a short isolated segment would
+    # produce.  0 disables.  See
+    # docs/.../heygen_like_lipsync_segmentation_td.md §5.7.
+    min_merged_lipsync_seconds: float = Field(
+        1.5,
+        ge=0.0,
+        le=10.0,
+        description="After majority-vote, if a merged segment is shorter than this many seconds it is forced entirely to passthrough. 0 disables. See docs/.../heygen_like_lipsync_segmentation_td.md §5.7.",
+    )
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
     # Pydantic ``Literal`` rejects unknown values at validation
@@ -1042,6 +1079,43 @@ def _clip_box(bbox: Tuple[int, int, int, int], frame_shape: Tuple[int, int, int]
 def _box_area(bbox: Tuple[int, int, int, int]) -> int:
     x1, y1, x2, y2 = bbox
     return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _last_track_id(
+    targets: List[Dict[str, object]], end_exclusive: int, fallback_index: int
+) -> Optional[int]:
+    """Return the track_id of the last valid (bbox!=None) frame in
+    ``targets[max(0, fallback_index):end_exclusive]`` scanning
+    backwards. Returns None when no valid frame in the window has
+    a track_id -- callers should treat that as "no opinion" and
+    fall back to the time-window merge.
+    """
+    upper = min(end_exclusive, len(targets))
+    lower = max(0, fallback_index)
+    for ti in range(upper - 1, lower - 1, -1):
+        if targets[ti].get("bbox") is None:
+            continue
+        track_id = targets[ti].get("track_id")
+        if track_id is not None:
+            return int(track_id)
+    return None
+
+
+def _first_track_id(
+    targets: List[Dict[str, object]], start: int, end_exclusive: int
+) -> Optional[int]:
+    """Return the track_id of the first valid (bbox!=None) frame
+    in ``targets[start:end_exclusive]``. Returns None when no
+    valid frame in the window has a track_id.
+    """
+    upper = min(end_exclusive, len(targets))
+    for ti in range(start, upper):
+        if targets[ti].get("bbox") is None:
+            continue
+        track_id = targets[ti].get("track_id")
+        if track_id is not None:
+            return int(track_id)
+    return None
 
 
 def _box_center(bbox: Tuple[int, int, int, int]) -> Tuple[float, float]:
@@ -3374,6 +3448,52 @@ class MuseTalkApiRuntime:
         return total
 
     @staticmethod
+    def _face_crop_histogram_distance(
+        crop_a: np.ndarray,
+        crop_b: np.ndarray,
+        bins: int = 16,
+        resize_to: int = 32,
+    ) -> float:
+        """Return 1 - histogram_intersection over downsized BGR crops.
+
+        Used for hard-cut / track-switch detection. Cheaper than
+        ``_face_color_histogram_distance`` (no per-channel split,
+        smaller crops, fewer bins) so it can be called O(N) over
+        a video's target sequence. Returns 0.0 on shape mismatch
+        / empty input so callers can safely skip a pair.
+
+        Direction matches ``_face_color_histogram_distance`` --
+        0.0 = identical content, ~1.0 = unrelated content. The
+        default ``hard_cut_distance_threshold`` (0.65) is tuned
+        to fire on a real cross-character / cross-shot jump while
+        not triggering on detector jitter or mild head turns.
+        """
+        if (
+            crop_a is None
+            or crop_b is None
+            or crop_a.size == 0
+            or crop_b.size == 0
+        ):
+            return 0.0
+        if resize_to <= 0:
+            return 0.0
+        # Normalize the two crops to a fixed small size so the
+        # histogram is comparable across frames with slightly
+        # different bbox sizes / aspect ratios.
+        a = cv2.resize(crop_a, (resize_to, resize_to), interpolation=cv2.INTER_AREA)
+        b = cv2.resize(crop_b, (resize_to, resize_to), interpolation=cv2.INTER_AREA)
+        a_hist = cv2.calcHist([a], [0, 1, 2], None, [bins] * 3, [0, 256] * 3)
+        b_hist = cv2.calcHist([b], [0, 1, 2], None, [bins] * 3, [0, 256] * 3)
+        cv2.normalize(a_hist, a_hist)
+        cv2.normalize(b_hist, b_hist)
+        intersection = float(
+            cv2.compareHist(a_hist, b_hist, cv2.HISTCMP_INTERSECT)
+        )
+        # intersection is in [0, 1] for normalized histograms; the
+        # distance is 1 - intersection so larger = more different.
+        return max(0.0, 1.0 - intersection)
+
+    @staticmethod
     def _face_max_tile_mse(
         generated: np.ndarray,
         reference: np.ndarray,
@@ -3519,9 +3639,13 @@ class MuseTalkApiRuntime:
         segment_consistency_enforced: bool,
         segment_consistency_passthrough_ratio: float,
         segment_consistency_merge_window_seconds: float,
+        segment_consistency_hard_cut_enabled: bool,
+        segment_consistency_hard_cut_distance_threshold: float,
+        segment_consistency_track_aware: bool,
+        min_merged_lipsync_seconds: float,
         source_fps: float,
         face_parser: Optional[FaceParsing],
-    ) -> Tuple[List[str], Dict[str, int]]:
+    ) -> Tuple[List[str], Dict[str, int], Dict[str, int]]:
         """Write every output frame to ``output_dir`` and return a
         per-frame provenance list of length ``output_frame_count``.
 
@@ -3563,6 +3687,24 @@ class MuseTalkApiRuntime:
             "skin_laplacian": 0,
             "segment_consistency": 0,
             "other": 0,
+        }
+        # Segmentation / merge decision counters. Distinct
+        # from ``fallback_reasons`` (which is the *render-quality*
+        # gate) -- this dict is populated by the segment
+        # consistency pass and the various per-frame filters
+        # (small face, short segment, motion outliers, etc).
+        # See docs/.../heygen_like_lipsync_segmentation_td.md §6.
+        passthrough_reasons: Dict[str, int] = {
+            "no_face": 0,
+            "no_speech": 0,
+            "face_too_small": 0,
+            "short_target_segment": 0,
+            "motion_outlier": 0,
+            "fast_motion": 0,
+            "mouth_diff_break": 0,
+            "speaker_switch": 0,
+            "hard_cut": 0,
+            "too_short": 0,
         }
         previous_resized: Optional[np.ndarray] = None
         # Track the source_index that produced ``previous_resized``
@@ -3959,14 +4101,22 @@ class MuseTalkApiRuntime:
         # output for the whole segment instead of letting a few
         # mixed frames flicker.
         if segment_consistency_enforced:
-            enforced = self._enforce_segment_consistency(
+            enforced, seg_reasons = self._enforce_segment_consistency(
                 provenance, targets, frames, write_frame,
                 passthrough_ratio=segment_consistency_passthrough_ratio,
                 merge_window_seconds=segment_consistency_merge_window_seconds,
                 source_fps=source_fps,
+                hard_cut_enabled=segment_consistency_hard_cut_enabled,
+                hard_cut_threshold=segment_consistency_hard_cut_distance_threshold,
+                track_aware=segment_consistency_track_aware,
+                min_merged_seconds=min_merged_lipsync_seconds,
             )
             fallback_reasons["segment_consistency"] = enforced
-        return provenance, fallback_reasons
+            for reason_key, reason_count in seg_reasons.items():
+                passthrough_reasons[reason_key] = (
+                    passthrough_reasons.get(reason_key, 0) + reason_count
+                )
+        return provenance, fallback_reasons, passthrough_reasons
 
     @staticmethod
     def _enforce_segment_consistency(
@@ -3977,7 +4127,11 @@ class MuseTalkApiRuntime:
         passthrough_ratio: float = 0.5,
         merge_window_seconds: float = 0.0,
         source_fps: float = 25.0,
-    ) -> int:
+        hard_cut_enabled: bool = True,
+        hard_cut_threshold: float = 0.65,
+        track_aware: bool = True,
+        min_merged_seconds: float = 1.5,
+    ) -> Tuple[int, Dict[str, int]]:
         """For each contiguous "valid" run (every frame in the run
         had a detectable target face), check the run's
         passthrough ratio.  When the ratio exceeds
@@ -3999,10 +4153,46 @@ class MuseTalkApiRuntime:
         instead of starting a new segment that would be
         rated as "mostly passthrough" and dropped.
 
-        Returns the count of frames rewritten this way.
+        Two new gates can refuse a merge inside the window
+        (see ``docs/.../heygen_like_lipsync_segmentation_td.md``
+        §5.1 and §5.5):
+
+        - ``hard_cut_enabled`` + ``hard_cut_threshold``: refuse
+          the merge if any adjacent-frame pair inside the
+          passthrough gap has a face-crop histogram distance
+          above the threshold (i.e. the camera/character
+          jumped).  Catches cross-shot / cross-character cuts
+          that a short passthrough gap would otherwise bridge.
+        - ``track_aware``: a pre-pass walks the target sequence
+          once, assigns a per-frame ``track_id`` based on
+          face-crop continuity, and Step 2 refuses any merge
+          where the boundary track_ids differ.  Falls back to
+          the time-window-only rule when track_id is missing.
+
+        Both are opt-in knobs.  When both are off the function
+        is exactly the pre-hardcut behavior.  All counters
+        fired (hard_cut, speaker_switch, too_short) are
+        reported in the returned ``passthrough_reasons`` dict
+        so the [LipSync-report] log line shows why a segment
+        was downgraded.
+
+        After the majority vote, segments whose total
+        duration is below ``min_merged_seconds`` are forced
+        entirely to passthrough (see §5.7) to avoid splice
+        artifacts on short isolated runs.
+
+        Returns ``(rewritten_count, passthrough_reasons)``.
+        ``rewritten_count`` is the count of frames rewritten
+        this way; ``passthrough_reasons`` records how many
+        times each of the new gates fired.
         """
+        empty_reasons: Dict[str, int] = {
+            "hard_cut": 0,
+            "speaker_switch": 0,
+            "too_short": 0,
+        }
         if not provenance or not targets:
-            return 0
+            return 0, empty_reasons
 
         # Step 1: collect raw contiguous valid segments.
         n = len(provenance)
@@ -4022,28 +4212,134 @@ class MuseTalkApiRuntime:
             raw_segments.append((seg_start, index))
 
         if not raw_segments:
-            return 0
+            return 0, empty_reasons
+
+        # Step 1.5: pre-pass to assign a per-frame track_id and
+        # detect hard cuts in the passthrough gaps.  Done before
+        # Step 2 so the merge logic can consult both signals.
+        # Skipped entirely when both new gates are off --
+        # preserves the pre-hardcut time-window behavior.
+        #
+        # Compare each new valid frame against the LAST valid
+        # frame regardless of how long the passthrough gap was
+        # (the 3-frame constraint from the mouth-diff filter
+        # would silently miss cuts separated by > 3 frames of
+        # passthrough -- e.g. a 5-frame gap between two
+        # speakers).  The conservative 0.65 threshold prevents
+        # the natural slow drift of a single speaker's lighting
+        # / pose from firing; the reset-after-fire logic below
+        # stops the new track's first frame from being compared
+        # against the old track's last frame and re-firing.
+        if track_aware or hard_cut_enabled:
+            current_track = 0
+            last_valid_index: Optional[int] = None
+            last_valid_crop: Optional[np.ndarray] = None
+            for fi in range(n):
+                source_index = min(fi, len(targets) - 1)
+                bbox = targets[source_index].get("bbox")
+                if bbox is None or source_index >= len(frames):
+                    continue
+                x1, y1, x2, y2 = bbox
+                frame = frames[source_index]
+                crop = frame[
+                    max(0, y1):min(frame.shape[0], y2),
+                    max(0, x1):min(frame.shape[1], x2),
+                ]
+                if crop.size == 0:
+                    last_valid_crop = None
+                    last_valid_index = None
+                    continue
+                if (
+                    last_valid_crop is not None
+                    and last_valid_index is not None
+                    and hard_cut_threshold > 0.0
+                ):
+                    dist = MuseTalkApiRuntime._face_crop_histogram_distance(
+                        crop, last_valid_crop
+                    )
+                    if dist > hard_cut_threshold:
+                        current_track += 1
+                        # Reset the reference crop so the new
+                        # track starts cleanly; otherwise the
+                        # first frame of the new track would
+                        # be compared against the last frame
+                        # of the old track and falsely fire
+                        # again on the *next* frame.
+                        last_valid_crop = None
+                        last_valid_index = None
+                        targets[source_index] = {
+                            **targets[source_index],
+                            "track_id": current_track,
+                        }
+                        continue
+                targets[source_index] = {
+                    **targets[source_index],
+                    "track_id": current_track,
+                }
+                last_valid_crop = crop
+                last_valid_index = fi
 
         # Step 2: merge segments that are within merge_window_seconds.
+        # When hard_cut_enabled or track_aware fire, the merge is
+        # refused and the segment is left as a new run.
+        reasons = dict(empty_reasons)
         if merge_window_seconds > 0.0 and source_fps > 0.0:
             merge_window_frames = max(1, int(round(merge_window_seconds * source_fps)))
             merged: List[Tuple[int, int]] = [raw_segments[0]]
             for seg_start, seg_end in raw_segments[1:]:
                 prev_start, prev_end = merged[-1]
                 gap = seg_start - prev_end
-                if gap <= merge_window_frames:
+                if gap > merge_window_frames:
+                    merged.append((seg_start, seg_end))
+                    continue
+                # Candidate merge inside the time window --
+                # now check the new gates.
+                refused = False
+                if hard_cut_enabled and hard_cut_threshold > 0.0 and frames is not None:
+                    # Adjacent-pair check across the gap.  Includes
+                    # the boundary pair (seg_start-1, seg_start) so
+                    # the cut into the next segment's first frame
+                    # is tested too.
+                    for gi in range(prev_end, seg_start):
+                        next_i = gi + 1
+                        if next_i >= len(frames):
+                            break
+                        crop_a = frames[gi]
+                        crop_b = frames[next_i]
+                        if crop_a is None or crop_b is None:
+                            continue
+                        dist = MuseTalkApiRuntime._face_crop_histogram_distance(
+                            crop_a, crop_b
+                        )
+                        if dist > hard_cut_threshold:
+                            reasons["hard_cut"] += 1
+                            refused = True
+                            break
+                if not refused and track_aware:
+                    prev_track = _last_track_id(targets, prev_end - 1, prev_start - 1)
+                    next_track = _first_track_id(targets, seg_start, seg_end)
+                    if (
+                        prev_track is not None
+                        and next_track is not None
+                        and prev_track != next_track
+                    ):
+                        reasons["speaker_switch"] += 1
+                        refused = True
+                if refused:
+                    merged.append((seg_start, seg_end))
+                else:
                     # Bridge the gap: extend the previous segment
                     # to cover the gap and the new segment.  The
                     # frames in the gap had bbox=None so they
                     # were passthrough -- they'll be counted in
                     # the merged-segment stats below.
                     merged[-1] = (prev_start, seg_end)
-                else:
-                    merged.append((seg_start, seg_end))
         else:
             merged = raw_segments
 
-        # Step 3: majority vote per merged segment.
+        # Step 3: majority vote + min-duration downgrade per
+        # merged segment.  Both rules are independent and
+        # either can force the whole segment to passthrough.
         rewritten = 0
         for seg_start, seg_end in merged:
             segment_provenance = provenance[seg_start:seg_end]
@@ -4058,10 +4354,21 @@ class MuseTalkApiRuntime:
             # strictly the majority.  Ties go to "leave alone"
             # so the user keeps whatever synthesized frames
             # they already have.
-            if (
+            majority_downgrade = (
                 passthrough_count > segment_length / 2
                 and passthrough_count / segment_length > passthrough_ratio
-            ):
+            )
+            # Independent post-merge duration gate (see §5.7).
+            # Short isolated segments are downgraded to avoid
+            # splice artifacts at the model/output boundary.
+            short_downgrade = False
+            if min_merged_seconds > 0.0 and source_fps > 0.0:
+                merged_duration = (seg_end - seg_start) / source_fps
+                if merged_duration < min_merged_seconds:
+                    short_downgrade = True
+            if majority_downgrade or short_downgrade:
+                if short_downgrade and not majority_downgrade:
+                    reasons["too_short"] += segment_length
                 for frame_index in range(seg_start, seg_end):
                     if provenance[frame_index] != "generated":
                         continue
@@ -4070,7 +4377,7 @@ class MuseTalkApiRuntime:
                     write_frame(frame_index, frames[source_index])
                     provenance[frame_index] = "passthrough"
                     rewritten += 1
-        return rewritten
+        return rewritten, reasons
 
     def _frames_to_video(self, frames_dir: Path, fps: float, temp_video_path: Path) -> None:
         subprocess.run(
@@ -4652,7 +4959,7 @@ class MuseTalkApiRuntime:
                 else None
             )
             render_dir = job_output_dir / "frames"
-            frame_provenance, fallback_reasons = self._write_result_frames(
+            frame_provenance, fallback_reasons, passthrough_reasons = self._write_result_frames(
                 frames,
                 targets,
                 generated,
@@ -4682,6 +4989,10 @@ class MuseTalkApiRuntime:
                 payload.segment_consistency_enforced,
                 payload.segment_consistency_passthrough_ratio,
                 payload.segment_consistency_merge_window_seconds,
+                payload.segment_consistency_hard_cut_enabled,
+                payload.segment_consistency_hard_cut_distance_threshold,
+                payload.segment_consistency_track_aware,
+                payload.min_merged_lipsync_seconds,
                 fps,
                 face_parser,
             )
@@ -4731,6 +5042,7 @@ class MuseTalkApiRuntime:
                 "generated_output_frames": len(generated),
                 "quality_fallback_frames": quality_fallback_frames,
                 "quality_fallback_reasons": fallback_reasons,
+                "passthrough_reasons": passthrough_reasons,
                 "effective_generated_output_frames": max(0, len(generated) - quality_fallback_frames),
                 "skipped_output_frames": skipped_output_frames,
                 "frame_provenance": frame_provenance,
@@ -4874,6 +5186,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
     speech_gate = result.get("speech_gate") or {}
     codeformer = result.get("codeformer") or {}
     fallback_reasons = result.get("quality_fallback_reasons") or {}
+    passthrough_reasons = result.get("passthrough_reasons") or {}
     gen = int(result.get("generated_output_frames", 0))
     qf = int(result.get("quality_fallback_frames", 0))
     be = prov_counts["blend_error"]
@@ -4886,6 +5199,7 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         "  filtered: motion=%d fast_motion=%d mouth_diff=%d small_face=%d short_segment=%d\n"
         "  generated: gen=%d quality_fallback=%d passthrough=%d blend_error=%d blended=%d\n"
         "  fallback_reasons: mouth_laplacian=%d mouth_drift_mse=%d skin_drift_mse=%d skin_laplacian=%d other=%d\n"
+        "  passthrough_reasons: hard_cut=%d speaker_switch=%d too_short=%d\n"
         "  identity_sim: min/med/max=%.3f/%.3f/%.3f\n"
         "  speech_gate: enabled=%s active=%s\n"
         "  codeformer: enabled=%s available=%s",
@@ -4921,6 +5235,9 @@ def _log_lipsync_report(job_id: str, result: Dict[str, object]) -> None:
         int(fallback_reasons.get("skin_drift_mse", 0)),
         int(fallback_reasons.get("skin_laplacian", 0)),
         int(fallback_reasons.get("other", 0)),
+        int(passthrough_reasons.get("hard_cut", 0)),
+        int(passthrough_reasons.get("speaker_switch", 0)),
+        int(passthrough_reasons.get("too_short", 0)),
         float(result.get("identity_similarity_min", 0.0)),
         float(result.get("identity_similarity_median", 0.0)),
         float(result.get("identity_similarity_max", 0.0)),
