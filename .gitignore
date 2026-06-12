@@ -2,6 +2,7 @@
 *.log
 .idea/
 .vscode/
+.qoder/
 *.pyc
 .ipynb_checkpoints
 results/
