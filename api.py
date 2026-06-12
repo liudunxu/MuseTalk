@@ -4874,6 +4874,19 @@ class MuseTalkApiRuntime:
                 "frames_skipped_by_pipeline": 0,
                 "elapsed_seconds": 0.0,
                 "error": "",
+                # Diagnostic counters for the post-CodeFormer
+                # cross-frame EMA. Populated below in the
+                # restored-crop loop. ``ema_chain_breaks`` counts
+                # every frame where the EMA skipped mixing for
+                # ANY reason (idx gap, shape mismatch, or track
+                # switch). ``ema_resets_on_track_switch`` is a
+                # subset of breaks where the per-frame track_id
+                # (set by the segment-consistency pre-pass) just
+                # changed -- these are the events that cause a
+                # visible pop if the EMA smears a previous
+                # identity onto a new one.
+                "ema_chain_breaks": 0,
+                "ema_resets_on_track_switch": 0,
             }
             if payload.codeformer_enabled and generated:
                 restorer, load_error = self._get_codeformer_restorer()
@@ -4911,21 +4924,56 @@ class MuseTalkApiRuntime:
                     # generated frames; if inference skipped a
                     # source frame, carrying the previous restored
                     # crop across the gap creates visible jumps.
+                    #
+                    # Track-aware reset: when the per-frame
+                    # ``track_id`` (set by the segment-consistency
+                    # pre-pass when ``segment_consistency_track_aware``
+                    # is on) just changed, the previous restored
+                    # crop belongs to a different identity; mixing
+                    # it onto the new identity would smear the old
+                    # face onto the new one. We still record the
+                    # current frame's output as the new chain seed
+                    # -- the *next* frame will start smoothing
+                    # from it -- so the EMA "restarts" cleanly
+                    # without an artificial pop.
                     restored_np = restored_batch.cpu().numpy()
                     cf_alpha = float(payload.codeformer_temporal_alpha)
                     prev_restored: Optional[np.ndarray] = None
                     prev_restored_index: Optional[int] = None
+                    prev_track_id: Optional[int] = None
+                    ema_chain_breaks = 0
+                    ema_resets_on_track_switch = 0
                     for i, idx in enumerate(sorted_indices):
                         face_out = restored_np[i]  # (3, 512, 512) in [-1, 1]
                         face_out = np.transpose(face_out, (1, 2, 0))  # (512, 512, 3) RGB
                         face_out = ((face_out + 1.0) / 2.0 * 255.0)
                         face_out = np.clip(face_out, 0, 255).astype(np.uint8)
+                        # Look up this output frame's track_id from
+                        # the per-source-frame target. ``None`` here
+                        # means track-aware is off or the source
+                        # frame has no bbox; in that case the EMA
+                        # guard below falls back to the legacy
+                        # "only mix adjacent indices" rule.
+                        source_index = self._source_index_for_output(
+                            idx, frame_count
+                        )
+                        cur_track_id: Optional[int] = None
+                        if 0 <= source_index < len(targets):
+                            cur_track_id = targets[source_index].get("track_id")
+                            if cur_track_id is not None:
+                                cur_track_id = int(cur_track_id)
+                        tracks_match = (
+                            prev_track_id is None
+                            or cur_track_id is None
+                            or prev_track_id == cur_track_id
+                        )
                         if (
                             0.0 < cf_alpha < 1.0
                             and prev_restored is not None
                             and prev_restored_index is not None
                             and idx - prev_restored_index == 1
                             and prev_restored.shape == face_out.shape
+                            and tracks_match
                         ):
                             face_out = cv2.addWeighted(
                                 face_out,
@@ -4934,13 +4982,24 @@ class MuseTalkApiRuntime:
                                 1.0 - cf_alpha,
                                 0,
                             )
+                        elif prev_restored is not None:
+                            # Count only "real" breaks -- the first
+                            # frame has prev_restored = None and is
+                            # just bootstrapping the chain, not
+                            # actually breaking anything.
+                            ema_chain_breaks += 1
+                            if not tracks_match and cur_track_id is not None:
+                                ema_resets_on_track_switch += 1
                         prev_restored = face_out
                         prev_restored_index = idx
+                        prev_track_id = cur_track_id
                         face_out = face_out[..., ::-1]  # RGB -> BGR
                         orig_h, orig_w = original_sizes[i]
                         if face_out.shape[0] != orig_h or face_out.shape[1] != orig_w:
                             face_out = cv2.resize(face_out, (orig_w, orig_h), interpolation=cv2.INTER_LANCZOS4)
                         generated[idx] = face_out
+                    codeformer_stats["ema_chain_breaks"] = ema_chain_breaks
+                    codeformer_stats["ema_resets_on_track_switch"] = ema_resets_on_track_switch
                     codeformer_stats.update(cf_stats.as_dict())
                     codeformer_stats["runtime_available"] = True
                     codeformer_stats["runtime_load_error"] = ""
