@@ -271,46 +271,7 @@ ce7b684: CodeFormer EMA 也读 track_id，track 切换时拒绝 mix
 
 ---
 
-## 附录 A：commit 索引（按主题）
-
-### 输出级时序
-- `e6f22c6` (06-09) feat(render): output-level temporal blend (opt-in) + stronger default sharpen
-- `5374be1` (06-11) feat(api): strengthen + un-gate output_temporal_blend
-
-### 段一致性
-- `63012ec` (06-11) feat(api): per-segment all-or-nothing
-- `e396ebf` (06-11) feat(api): majority vote
-- `aa8a653` (06-11) feat(api): time-window merge
-- `4b4987a` (06-12) feat(api): hard cut + track-aware + min-merged
-- `ce7b684` (06-12) fix(api): CodeFormer EMA track-aware reset
-
-### 嘴部融合
-- `214cffd`, `7fd6373`, `bff3cb8`, `c771614`, `d68a302`, `87f9884`, `6b0e700`, `62ceb85`, `3c4ca83`, `d3fdba6`, `a72390e`
-
-### 质量门控
-- `1aa48fb`, `1a6d93c`, `b022880`, `1abcab1`, `9a82feb`, `9177288`, `c284ca2`, `c2d2429`, `58eab08`, `e03882c`, `ba37373`, `68b7fb1`, `b822dab`, `cc51e3c`, `72cd85c`
-
-### 人脸跟踪
-- `604b11f`, `2bcda08`, `0e89728`, `62a3923`
-
-### CodeFormer
-- `501737f`, `44a9575`, `22a1865`, `3e92ae1`, `90db126`, `ce7b684`
-
-### /api/faces 静音脸
-- `8a382f0`
-
-### 性能
-- `62e225a`, `7b8c49d`, `67c2f7c`
-
-### 调参方法论
-- `8e6a3db`
-
-### 回滚 / 清理
-- `16a44f6` (rollback), `2851bde` (cleanup)
-
----
-
-## 附录 B：相关文档链接
+## 附录 A：相关文档链接
 
 - 切段/合并策略设计：[heygen_like_lipsync_segmentation_td.md](./heygen_like_lipsync_segmentation_td.md)
 - 调参方法论：[AGENTS.md §"Tuning Methodology & Lessons Learned"](../AGENTS.md)
