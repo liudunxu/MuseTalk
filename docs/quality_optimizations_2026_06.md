@@ -276,4 +276,5 @@ ce7b684: CodeFormer EMA 也读 track_id，track 切换时拒绝 mix
 - 切段/合并策略设计：[heygen_like_lipsync_segmentation_td.md](./heygen_like_lipsync_segmentation_td.md)
 - 调参方法论：[AGENTS.md §"Tuning Methodology & Lessons Learned"](../AGENTS.md)
 - 项目结构总览：[PROJECT_CONTEXT.md](../PROJECT_CONTEXT.md)
+- **姊妹项目（LatentSync）近两周策略交叉对照**：[cross_project_lessons_latentsync_2026_06.md](./cross_project_lessons_latentsync_2026_06.md)，§I 给出了 MuseTalk 下一轮的借鉴优先级
 - API 行为约束：[AGENTS.md §"API Surface"](../AGENTS.md)
