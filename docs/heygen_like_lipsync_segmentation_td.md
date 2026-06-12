@@ -8,6 +8,9 @@
 
 文档不依赖某个项目里的片段编号、函数名或 UI 名称。实现时请把下文里的概念映射到你们自己的 manifest、timeline、clip、task queue 或 media asset 命名。
 
+**相关文档**：
+- 近期（2026-06-05 ~ 2026-06-12）50 个 commit 的质量提升与性能优化总结：[quality_optimizations_2026_06.md](./quality_optimizations_2026_06.md)，其中 §2"段一致性切分"是本文档的实操落地记录
+
 ## 1. 背景
 
 我们在自建 lip-sync 链路中遇到过几类典型坏例：
