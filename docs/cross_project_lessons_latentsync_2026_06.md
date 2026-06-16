@@ -275,3 +275,100 @@ MuseTalk 和 LatentSync 是同一个团队（dundun）维护的姊妹项目，AP
 | 适用场景 | 实时直播、avatar | 高质量离线、影视 |
 
 → 策略可以互相借鉴，但**实现细节需要适配**：MuseTalk 没有 scheduler/num_inference_steps，所以"扩散专属"参数（cfg/eta）不适用；LatentSync 关心 timestep，所以会有"在 t=0 时"类限定，MuseTalk 直接是最终结果。
+
+---
+
+## §K. 追加：2026-06-13 ~ 2026-06-16 LatentSync 后续两周窗口
+
+更新时间：2026-06-16
+窗口外追加：上次的 §J 时间线停到 6/12，6/15~6/16 又有一波"参数微调 + 边界修复"提交，逐一对照如下。
+
+### K.1 切脸/场景切连续性重置（`33bc708` 2026-06-16）
+
+**LatentSync 做法**：在主循环里加 `_source_frame_scene_cut_score(prev, curr)`（BGR 直方图距离 + luma 差），超过阈值时在 `__call__` 入口主动 `reset_p_bias()` + 清空 `prev_yaw` / `prev_motion_state` / `prev_temporal_*` 等 carry state；**不** skip 帧，只重置状态。
+
+**MuseTalk 现状**：
+- `ce7b684` CodeFormer EMA 已经按 `track_id` 切换处 reset（`api.py:4726-4736`）
+- `segment_consistency_track_aware` 在 hard-cut 处递增 `track_id`（`musetalk/utils/segment_consistency.py:272-285`）
+- 也就是**切脸→重置 EMA chain 的路径已经覆盖**——`track_id` 一变 → EMA 跳过 mix → 下一帧重起 chain
+
+**借鉴优先级**：🟢 **不需要新代码**。补一个 test 验证 "hard cut → track_id 切换 → EMA 不混" 已经够了（落到 §E 的 `test_temporal_blend.py`）。
+
+### K.2 默认调参：`min_merged_lipsync_seconds` 和 `mouth_temporal_stabilization_strength`（`7b6fe3a` → `64c65bd` 2026-06-15）
+
+**LatentSync 最终值**（连续两轮微调）：
+| 参数 | 起点 | `7b6fe3a` | `64c65bd` 最终 | 原因 |
+|---|---|---|---|---|
+| `min_merged_lipsync_seconds` | 1.5 | 0.6 | **0.4** | 1.5s 太激进，0.5-1.0s 正常短句/短镜头被错杀；0.4s 留下 flicker 防护栏 |
+| `mouth_temporal_stabilization_strength` | 0.15 | — | **0.10** | 0.15 太重，把开口帧平均回去让语音看着"欠发音"；0.10 是平衡点 |
+| `mouth_audio_motion_min_scale` | 0.75 | — | 0.85 | 高能语音帧需要保留更多 current-frame motion |
+| `mouth_audio_motion_max_scale` | 1.20 | — | 1.35 | 同上 |
+| `side_face_episode_pre/post_pad` | 3 | 2 | **1** | 缩短过渡区间，减少"边界不必要切" |
+| `yaw_warn_threshold_ratio` | 0.75 | — | 0.80 | 24° 警告带（30°×0.80）减少轻度转头被过度 skip |
+
+**MuseTalk 对照**（**有等价旋钮的两项**）：
+- ✅ `min_merged_lipsync_seconds`：默认 1.5 → **0.4**（已应用：`api.py:334-348`）
+- ✅ `mouth_temporal_stabilization_strength`：默认 0.08 → **0.10**（已应用：`api.py:362-368`）
+- ⚪ `mouth_audio_motion_min/max_scale`：MuseTalk 没有等价参数（嘴部动态通过 `mouth_openness` 链路表达）
+- ⚪ `side_face_episode_pre/post_pad` / `yaw_warn_threshold_ratio`：MuseTalk 还没有 yaw 过滤实现（§B 未做），等 §B 落地再考虑
+
+**借鉴优先级**：🟢 **已完成**。两项 Pydantic 默认值已改，文档说明已加。
+
+### K.3 嘴部 mask 钳到 fixed mask 边界（`67e6422` 2026-06-15）
+
+**LatentSync 做法**：`generate_dynamic_mouth_mask(..., fixed_keep_mask=...)` 在末尾做 `torch.maximum(dynamic_keep, fixed_keep)`，防止大张嘴/大笑时 landmark 推导的 mask 溢出下半脸。
+
+**MuseTalk 现状**：
+- 用 BiSeNet parser 直接出 `lips_only` / `lips_outer_only` mask（`musetalk/utils/blending.py:226-241`）
+- 已有 `lips_blend_dilation`（默认 2 px）做边界外扩
+- BiSeNet parser 输出本来就在 trained-on 的下半脸范围内，**溢出风险远低于 landmark 推导**
+
+**借鉴优先级**：🟢 低。架构差异，强行抄会让 MuseTalk 多一次 parser 跑批，得不偿失。
+
+### K.4 `restore_video` 用 `source_frame` 修 IndexError（`9f07a72` 2026-06-15）
+
+**LatentSync 做法**：audio > video 长度时，`loop_video` 返回的 `output_index` 超出 `video_frames` 长度；用 `video_frames[index]` 直接寻址会 IndexError。修复：返回 `source_indices`，`restore_video` 内部用 `source_indices[index]` 寻址 + 钳位。
+
+**MuseTalk 现状**：
+- 写帧主循环里写的是 `source_index = self._source_index_for_output(output_index, frame_count)`（`api.py:3685`）
+- 然后 `original_frame = frames[source_index].copy()`（`api.py:3686`）
+
+也就是**MuseTalk 早就在用 `source_index` 寻址**（`_source_index_for_output` 内部钳位到 `[0, frame_count-1]`），没有 LatentSync 那个 bug。
+
+**借鉴优先级**：⚪ **不需要**。MuseTalk 架构上没这个 bug。
+
+### K.5 audio sync offset + source affine cache + adaptive quality fallback（`8b05034` 2026-06-15）
+
+**LatentSync 做法**（大组合提交）：
+1. `audio2feature.feature2chunks` 加 `offset_seconds` 参数（chunk 生成时就用偏移后的 vid_idx）
+2. `loop_video` 改成返回 `source_indices`，避免复制 `video_frames` 数组（音频>视频时长场景）
+3. `restore_video` 用 `source_indices` 寻址 + 复用预计算 `dynamic_masks`
+4. 加自适应 quality fallback：mouth sharpness ratio + mouth-region diff + identity sim + yaw + audio scale + temporal delta 合成一个 `[0,1]` 质量分，低于阈值回退到 source
+
+**MuseTalk 对照**：
+- ⚪ (1) audio offset：**MuseTalk 已有** `audio_sync_offset_seconds`（`api.py:657`），在 `_audio_feature_index_for_output`（`api.py:2971-2984`）做后置寻址；语义上等价于 chunk 时偏移（前提是 audio 覆盖整个 video，没有 loop 截断）
+- ⚪ (2)(3) source affine cache：MuseTalk 单步生成没有 per-frame affine 循环（`_encode_latents` 一次性 encode 所有帧 latents），不适用
+- ⚪ (4) adaptive quality fallback：MuseTalk 已有 `quality_gate_enabled: bool = False`（默认关闭，opt-in）+ 多项 `quality_*` 旋钮（`api.py:375-403`）。`8b05034` 的合成质量分是更精细的版本，**可以等 MuseTalk 客户实际报退化再升级**（不阻塞）
+
+**借鉴优先级**：🟢 低。功能上 MuseTalk 已经覆盖；如果未来要追平 LatentSync 的 composite score，可以加 `_compute_composite_quality_score` 静态方法，但 ROI 不高。
+
+### K.6 LatentSync 这两周的隐含教训
+
+值得 MuseTalk 记一笔的元规律：
+
+1. **"放松默认"是连续两轮的微调过程**，不是一个数字直接跳到位。`7b6fe3a` 0.6→`64c65bd` 0.4，差 3.5 小时。说明：**调默认是 empirical，每次只挪一小步 + 留灰度让客户可调**。MuseTalk 这次跳 1.5→0.4 步子有点大，建议**先观察 1~2 周**客户端表现，必要时回滚到 0.6。
+2. **"切脸 reset" 在 MuseTalk 架构上天然通过 `track_id` 实现了**——`track_id` 是公共的状态总线，新人加任何"per-frame EMA / carry state"时只要遵守 "track_id 变 → reset"，就不用单独搞 `scene_cut_break_*` 旋钮。
+3. **`source_frame` vs `video_frames[index]` 的 bug 模式值得记入 memory**：audio > video 长度时 output_index ≠ source_index。MuseTalk 的 `_source_index_for_output` 早处理了，但任何新增的"per-output 写帧"循环都要复用这个 helper。
+
+### K.7 MuseTalk 本轮借鉴落地清单
+
+| 落地项 | 状态 | 改动 |
+|---|---|---|
+| `min_merged_lipsync_seconds` 默认 1.5 → 0.4 | ✅ | `api.py:334-348` |
+| `mouth_temporal_stabilization_strength` 默认 0.08 → 0.10 | ✅ | `api.py:362-368` |
+| 跨项目 lessons 文档追加 §K | ✅ | `docs/cross_project_lessons_latentsync_2026_06.md` §K.1~K.7 |
+| 给 `min_merged_lipsync_seconds=0.4` 留 1~2 周观察窗 | 🟡 待观察 | 客户端 `passthrough_reasons.too_short` 计数 |
+| §E Unit tests for hard-cut → EMA reset | ⏳ 未开始 | 落到 `tests/test_temporal_blend.py` |
+| §B Yaw 过滤 + `side_face_*_pad` / `yaw_warn_*` 调参 | ⏳ 未开始 | §I 优先级 🟢 2 |
+
+**LatentSync 这两周的提交里没有能直接搬过来但 MuseTalk 缺的核心策略**。剩下的可借鉴项都是 §I 里已经在跟进的（§A landmark EMA、§B yaw 过滤、§E unit tests）。
