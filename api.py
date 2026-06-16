@@ -331,11 +331,16 @@ class LipSyncRequest(BaseModel):
     # splice artifacts that a short isolated segment would
     # produce.  0 disables.  See
     # docs/.../heygen_like_lipsync_segmentation_td.md §5.7.
+    # Default 0.4s mirrors LatentSync 64c65bd (was 1.5, then
+    # 0.6 in 7b6fe3a).  1.5s was over-aggressive: a normal
+    # 0.5-1.0s utterance or short shot got dropped.  0.4s
+    # keeps the guardrail against isolated flicker while
+    # allowing normal short utterances to survive.
     min_merged_lipsync_seconds: float = Field(
-        1.5,
+        0.4,
         ge=0.0,
         le=10.0,
-        description="After majority-vote, if a merged segment is shorter than this many seconds it is forced entirely to passthrough. 0 disables. See docs/.../heygen_like_lipsync_segmentation_td.md §5.7.",
+        description="After majority-vote, if a merged segment is shorter than this many seconds it is forced entirely to passthrough. 0 disables. See docs/.../heygen_like_lipsync_segmentation_td.md §5.7. Default 0.4s mirrors LatentSync 64c65bd.",
     )
     bbox_shift: int = 0
     extra_margin: int = Field(10, ge=0, le=100)
@@ -359,7 +364,11 @@ class LipSyncRequest(BaseModel):
     mouth_detail_strength: float = Field(0.90, ge=0.0, le=1.0)
     mouth_color_match_strength: float = Field(0.30, ge=0.0, le=1.0)
     mouth_sharpen_strength: float = Field(0.50, ge=0.0, le=1.0)
-    mouth_temporal_stabilization_strength: float = Field(0.08, ge=0.0, le=0.6)
+    mouth_temporal_stabilization_strength: float = Field(0.10, ge=0.0, le=0.6)
+    # Default 0.10 mirrors LatentSync 64c65bd (was 0.08).
+    # 0.08 was too light to actually damp the high-frequency
+    # jitter that MuseTalk output tends to have; 0.10 is the
+    # validated balance.
     mouth_temporal_stabilization_max_delta: float = Field(0.12, ge=0.0, le=2.0)
     # Inpaint mask override. None = use the server-side default.
     # MuseTalk does not consume this field (encoder-decoder pipeline,
